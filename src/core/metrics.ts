@@ -97,7 +97,6 @@ export class MetricsCollector {
     this.windowDuplicates = 0;
     this.windowDrained = 0;
 
-    // Calculate latency percentiles
     if (this.latencySamples.length > 0) {
       this.latencySamples.sort((a, b) => a - b);
       const len = this.latencySamples.length;
@@ -105,11 +104,10 @@ export class MetricsCollector {
       this.p95Latency = Number((this.latencySamples[Math.floor(len * 0.95)] ?? 0).toFixed(2));
       this.p99Latency = Number((this.latencySamples[Math.floor(len * 0.99)] ?? 0).toFixed(2));
       this.latencySamples = [];
-    } else {
-      // Default idle latency values
-      this.p50Latency = 0.8;
-      this.p95Latency = 1.4;
-      this.p99Latency = 2.5;
+    } else if (!trafficActive && this.currentIncomingRps === 0) {
+      this.p50Latency = 0;
+      this.p95Latency = 0;
+      this.p99Latency = 0;
     }
 
     const bufferStats = bufferQueue.getStats();

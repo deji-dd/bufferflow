@@ -10,20 +10,29 @@
     "build": "vite build",
     "start": "bun run src/index.ts",
     "test": "bun test",
+    "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write ."
   },
   "dependencies": {
-    "elysia": "latest",
     "@elysiajs/cors": "latest",
-    "@elysiajs/static": "latest"
+    "@elysiajs/static": "latest",
+    "@xyflow/react": "latest",
+    "elysia": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "recharts": "latest"
   },
   "devDependencies": {
     "@biomejs/biome": "latest",
     "@tailwindcss/vite": "latest",
     "@types/bun": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "@vitejs/plugin-react": "latest",
     "tailwindcss": "latest",
+    "typescript": "latest",
     "vite": "latest"
   }
 }

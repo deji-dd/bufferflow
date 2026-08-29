@@ -26,20 +26,161 @@ body {
   overflow-x: hidden;
 }
 
-/* Glassmorphic card utility */
+/* Glassmorphic card utility - no backdrop-filter transitions to ensure instant 0ms theme switching */
 .glass-card {
   background: rgba(18, 24, 38, 0.7);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   border: 1px solid rgba(255, 255, 255, 0.08);
   box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
-  transition:
-    border-color 0.2s ease,
-    box-shadow 0.2s ease;
+  transition: border-color 0.15s ease;
 }
 
 .glass-card:hover {
   border-color: rgba(255, 255, 255, 0.14);
+}
+
+/* Light Mode Overrides */
+html.light body {
+  background-color: #f8fafc;
+  color: #0f172a;
+}
+
+html.light .glass-card {
+  background: rgba(255, 255, 255, 0.88);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  box-shadow:
+    0 10px 25px -5px rgba(0, 0, 0, 0.06),
+    0 8px 10px -6px rgba(0, 0, 0, 0.02);
+}
+
+html.light .glass-card:hover {
+  border-color: rgba(0, 0, 0, 0.16);
+}
+
+html.light .text-white {
+  color: #0f172a !important;
+}
+
+html.light .text-\[\#f1f5f9\] {
+  color: #0f172a !important;
+}
+
+html.light .text-\[\#94a3b8\] {
+  color: #475569 !important;
+}
+
+html.light .text-\[\#64748b\] {
+  color: #64748b !important;
+}
+
+html.light .border-white\/10 {
+  border-color: rgba(0, 0, 0, 0.08) !important;
+}
+
+html.light .bg-\[\#04060a\] {
+  background-color: #f1f5f9 !important;
+}
+
+html.light .bg-\[\#0a0e16\]\/80 {
+  background-color: rgba(255, 255, 255, 0.9) !important;
+  border-color: rgba(0, 0, 0, 0.08) !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04) !important;
+}
+
+html.light .bg-\[\#070a10\]\/70 {
+  background-color: rgba(241, 245, 249, 0.9) !important;
+  border-color: rgba(0, 0, 0, 0.08) !important;
+}
+
+html.light .bg-\[\#0f1522\]\/90 {
+  background-color: rgba(255, 255, 255, 0.96) !important;
+  border-color: rgba(0, 0, 0, 0.12) !important;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08) !important;
+}
+
+html.light select,
+html.light .bg-\[\#0d111a\] {
+  background-color: #ffffff !important;
+  color: #0f172a !important;
+  border-color: rgba(0, 0, 0, 0.12) !important;
+}
+
+html.light .bg-white\/5 {
+  background-color: rgba(0, 0, 0, 0.04) !important;
+  color: #0f172a !important;
+  border-color: rgba(0, 0, 0, 0.1) !important;
+}
+
+html.light .bg-white\/10 {
+  background-color: rgba(0, 0, 0, 0.08) !important;
+  color: #334155 !important;
+}
+
+html.light .bg-\[\#0f1521\] {
+  background-color: #e2e8f0 !important;
+  color: #334155 !important;
+}
+
+html.light .ambient-orb {
+  opacity: 0.05;
+}
+
+html.light #dlq-modal {
+  background-color: rgba(15, 23, 42, 0.45);
+}
+
+html.light .text-\[\#00f0ff\] {
+  color: #0284c7 !important;
+}
+
+html.light .text-\[\#a855f7\] {
+  color: #9333ea !important;
+}
+
+/* DAG Node Cards in Light Mode */
+html.light .dag-node-card {
+  background-color: #ffffff !important;
+  border-color: rgba(0, 0, 0, 0.14) !important;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.08) !important;
+}
+
+html.light .dag-node-card .dag-title {
+  color: #0f172a !important;
+}
+
+html.light .dag-badge-idle {
+  background-color: #f1f5f9 !important;
+  color: #475569 !important;
+  border-color: #cbd5e1 !important;
+}
+
+html.light .react-flow__background {
+  background-color: transparent !important;
+}
+
+html.light .react-flow__background pattern circle {
+  fill: #cbd5e1 !important;
+}
+
+html.light .react-flow__edge-path {
+  stroke: #cbd5e1;
+}
+
+html.light .react-flow__edge.animated .react-flow__edge-path {
+  stroke: #0284c7;
+}
+
+html.light .text-\[\#10b981\] {
+  color: #059669 !important;
+}
+
+html.light .text-\[\#f59e0b\] {
+  color: #d97706 !important;
+}
+
+html.light .text-\[\#f43f5e\] {
+  color: #e11d48 !important;
 }
 
 /* Status dots & Pulses */
@@ -113,6 +254,10 @@ body {
   outline: none;
 }
 
+html.light .custom-range {
+  background: rgba(0, 0, 0, 0.09);
+}
+
 .custom-range::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
@@ -155,4 +300,11 @@ body {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.24);
+}
+
+html.light ::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+}
+html.light ::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
 }

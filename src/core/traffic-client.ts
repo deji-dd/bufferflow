@@ -1,10 +1,18 @@
-import type { TrafficConfig } from './types';
+import type { BurstProgress, TrafficConfig } from './types';
+
+export type IngressDispatchHandler = (
+  key: string,
+  payload: any,
+  failureRate: number,
+  downstreamLatencyMs: number
+) => void;
 
 export class TrafficClient {
   private isRunning: boolean = false;
   private intervalTimer: any = null;
   private autoStopTimer: any = null;
   private targetUrl: string;
+  private burstStartTime: number = 0;
 
   private currentConfig: TrafficConfig = {
     targetRps: 2000,
@@ -18,12 +26,23 @@ export class TrafficClient {
   private sentCount: number = 0;
   private recentKeys: string[] = [];
   private maxKeyHistory: number = 1000;
+  private sessionId: string;
+  private dispatchHandler?: IngressDispatchHandler;
 
-  constructor(targetUrl: string = 'http://127.0.0.1:3001/api/ingress') {
+  constructor(
+    targetUrl: string = 'http://127.0.0.1:3001/api/ingress',
+    sessionId: string = 'default',
+    dispatchHandler?: IngressDispatchHandler
+  ) {
     this.targetUrl = targetUrl;
+    this.sessionId = sessionId;
+    this.dispatchHandler = dispatchHandler;
   }
 
-  public start(config: Partial<TrafficConfig> = {}): { success: boolean; message: string } {
+  public start(config: Partial<TrafficConfig> = {}): {
+    success: boolean;
+    message: string;
+  } {
     if (this.isRunning) {
       this.stop();
     }
@@ -32,6 +51,7 @@ export class TrafficClient {
     this.isRunning = true;
     this.sentCount = 0;
     this.recentKeys = [];
+    this.burstStartTime = Date.now();
 
     const targetRps = Math.max(10, this.currentConfig.targetRps);
     // Dispatch every 25ms in batches: batchSize = targetRps * 0.025
@@ -77,30 +97,63 @@ export class TrafficClient {
     return { ...this.currentConfig };
   }
 
+  public getProgress(): BurstProgress {
+    if (!this.isRunning) {
+      return {
+        active: false,
+        elapsedSec: 0,
+        durationSec: this.currentConfig.durationSec,
+        pct: 0,
+      };
+    }
+    const elapsed = Math.min(
+      this.currentConfig.durationSec,
+      Math.floor((Date.now() - this.burstStartTime) / 1000)
+    );
+    const pct =
+      this.currentConfig.durationSec > 0
+        ? Math.min(100, Math.round((elapsed / this.currentConfig.durationSec) * 100))
+        : 100;
+    return {
+      active: true,
+      elapsedSec: elapsed,
+      durationSec: this.currentConfig.durationSec,
+      pct,
+    };
+  }
+
   private dispatchBatch(batchSize: number): void {
     for (let i = 0; i < batchSize; i++) {
       this.sendSingleRequest();
     }
   }
 
-  private async sendSingleRequest(): Promise<void> {
+  private sendSingleRequest(): void {
     this.sentCount++;
     const { key, payload } = this.generatePayload();
 
+    if (this.dispatchHandler) {
+      this.dispatchHandler(
+        key,
+        payload,
+        this.currentConfig.failureRate,
+        this.currentConfig.downstreamLatencyMs
+      );
+      return;
+    }
+
     try {
-      // Direct high-speed loopback HTTP POST
       fetch(this.targetUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Idempotency-Key': key,
+          'X-Session-Id': this.sessionId,
           'X-Simulate-Failure-Rate': String(this.currentConfig.failureRate),
           'X-Simulate-Downstream-Latency': String(this.currentConfig.downstreamLatencyMs),
         },
         body: JSON.stringify(payload),
-      }).catch(() => {
-        // Ignore loopback client disconnects during burst teardowns
-      });
+      }).catch(() => {});
     } catch {
       // Ignored
     }
@@ -113,7 +166,6 @@ export class TrafficClient {
       Math.random() * 100 < this.currentConfig.idempotencyCollisionRate;
 
     if (shouldCollide) {
-      // Re-use an existing key to test idempotency deduplication
       const randomIndex = Math.floor(Math.random() * this.recentKeys.length);
       key = this.recentKeys[randomIndex];
     } else {
@@ -124,50 +176,41 @@ export class TrafficClient {
       this.recentKeys.push(key);
     }
 
-    let data: Record<string, any>;
-    const schema = this.currentConfig.schemaType;
-
-    if (schema === 'fintech') {
-      data = {
-        transactionId: key,
-        accountFrom: `acc_${Math.floor(100000 + Math.random() * 900000)}`,
-        accountTo: `acc_${Math.floor(100000 + Math.random() * 900000)}`,
-        amount: Number((Math.random() * 15000).toFixed(2)),
+    const payloadByType = {
+      ecommerce: {
+        eventType: 'ORDER_CHECKOUT',
+        orderId: `ord_${Math.random().toString(36).substring(2, 8)}`,
+        amount: Number((Math.random() * 250 + 10).toFixed(2)),
         currency: 'USD',
-        channel: 'SWIFT_ISO20022',
-        timestamp: Date.now(),
-      };
-    } else if (schema === 'iot') {
-      data = {
-        deviceId: `sensor-${Math.floor(1 + Math.random() * 50)}`,
-        telemetry: {
-          temperatureC: Number((18 + Math.random() * 35).toFixed(2)),
-          pressureKPa: Number((98 + Math.random() * 12).toFixed(2)),
-          vibrationHz: Number((50 + Math.random() * 120).toFixed(1)),
-        },
-        firmware: 'v2.4.1',
-        timestamp: Date.now(),
-      };
-    } else {
-      // ecommerce
-      data = {
-        orderId: key,
-        customerId: `cust_${Math.floor(1000 + Math.random() * 9000)}`,
+        customerId: `usr_${Math.floor(Math.random() * 10000)}`,
         items: [
-          { sku: 'ITEM-X9', qty: Math.floor(1 + Math.random() * 4), price: 49.99 },
-          { sku: 'ITEM-Z1', qty: 1, price: 129.5 },
+          { sku: 'ITEM-ALPHA', qty: Math.floor(Math.random() * 3) + 1 },
+          { sku: 'ITEM-BETA', qty: 1 },
         ],
-        totalAmount: Number((179.49 + Math.random() * 200).toFixed(2)),
-        status: 'PENDING_CHECKOUT',
-        timestamp: Date.now(),
-      };
-    }
+      },
+      fintech: {
+        eventType: 'LEDGER_SETTLEMENT',
+        transactionId: `txn_${Math.random().toString(36).substring(2, 10)}`,
+        amount: Number((Math.random() * 50000 + 100).toFixed(2)),
+        sourceAccount: `acc_${Math.floor(Math.random() * 900000 + 100000)}`,
+        destinationAccount: `acc_${Math.floor(Math.random() * 900000 + 100000)}`,
+        transferType: 'SWIFT_ACH_DIRECT',
+      },
+      iot: {
+        eventType: 'TELEMETRY_SAMPLE',
+        deviceId: `sensor_${Math.floor(Math.random() * 500)}`,
+        temperatureCelsius: Number((Math.random() * 35 + 15).toFixed(1)),
+        pressureHpa: Number((Math.random() * 50 + 980).toFixed(1)),
+        batteryPct: Math.floor(Math.random() * 100),
+      },
+    };
 
     return {
       key,
       payload: {
-        schemaType: schema,
-        data,
+        schemaType: this.currentConfig.schemaType,
+        timestamp: Date.now(),
+        data: payloadByType[this.currentConfig.schemaType],
       },
     };
   }

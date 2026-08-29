@@ -59,10 +59,18 @@ export interface SystemConfig {
   mockDownstreamFailureRate: number; // 0-100%
 }
 
+export interface BurstProgress {
+  active: boolean;
+  elapsedSec: number;
+  durationSec: number;
+  pct: number;
+}
+
 export interface TelemetryFrame {
   timestamp: number;
   trafficActive: boolean;
   activeTargetRps: number;
+  burstProgress?: BurstProgress;
   metrics: {
     incomingRps: number;
     acceptedRps: number;

@@ -1,82 +1,18 @@
 import { cors } from '@elysiajs/cors';
 import { staticPlugin } from '@elysiajs/static';
 import { Elysia, t } from 'elysia';
-import { BufferQueue } from './core/buffer-queue';
-import { DeadLetterQueue } from './core/dlq';
-import { IdempotencyStore } from './core/idempotency';
-import { MetricsCollector } from './core/metrics';
-import { TokenBucketRateLimiter } from './core/rate-limiter';
-import { TrafficClient } from './core/traffic-client';
-import type { IngressPayload, SystemConfig } from './core/types';
-import { WorkerPool } from './core/worker-pool';
+import { SessionManager, type SimulationSession } from './core/simulation-session';
 
 const PORT = Number(process.env.PORT || 3001);
+const sessionManager = new SessionManager(PORT);
 
-// System Defaults
-const config: SystemConfig = {
-  rateLimitPerSec: 3500,
-  rateLimitBurst: 6000,
-  bufferCapacity: 50000,
-  workerCount: 8,
-  routingStrategy: 'LEAST_CONNECTIONS',
-  circuitFailureThreshold: 4,
-  circuitRecoveryTimeMs: 3000,
-  maxRetries: 3,
-  mockDownstreamLatencyMs: 12,
-  mockDownstreamFailureRate: 5,
-};
-
-// Core Engine Instances
-const rateLimiter = new TokenBucketRateLimiter(config.rateLimitPerSec, config.rateLimitBurst);
-const idempotencyStore = new IdempotencyStore(100000, 60000);
-const bufferQueue = new BufferQueue(config.bufferCapacity);
-const dlq = new DeadLetterQueue(10000);
-const metricsCollector = new MetricsCollector();
-const trafficClient = new TrafficClient(`http://127.0.0.1:${PORT}/api/ingress`);
-
-const workerPool = new WorkerPool({
-  workerCount: config.workerCount,
-  routingStrategy: config.routingStrategy,
-  circuitFailureThreshold: config.circuitFailureThreshold,
-  circuitRecoveryTimeMs: config.circuitRecoveryTimeMs,
-  maxRetries: config.maxRetries,
-  mockDownstreamLatencyMs: config.mockDownstreamLatencyMs,
-  mockDownstreamFailureRate: config.mockDownstreamFailureRate,
-});
-
-// Link worker pool callbacks to metrics collector
-workerPool.setEventProcessedCallback((_item, success, _workerId) => {
-  metricsCollector.recordJobProcessed(success);
-});
-
-// Start worker pool processing loop
-workerPool.start(bufferQueue, dlq);
-
-// Active WebSocket subscriptions for telemetry broadcast
-const telemetrySockets = new Set<any>();
-
-// 250ms Telemetry Broadcast Loop
-setInterval(() => {
-  if (telemetrySockets.size === 0) return;
-
-  const frame = metricsCollector.tick(
-    bufferQueue,
-    dlq,
-    workerPool.getWorkers(),
-    workerPool.getRoutingStrategy(),
-    trafficClient.isActive(),
-    trafficClient.getConfig().targetRps
-  );
-
-  const payloadStr = JSON.stringify(frame);
-  for (const ws of telemetrySockets) {
-    try {
-      ws.send(payloadStr);
-    } catch {
-      telemetrySockets.delete(ws);
-    }
-  }
-}, 250);
+function getSession(
+  headers: Record<string, string | undefined>,
+  query?: Record<string, string | undefined>
+): SimulationSession {
+  const id = (headers['x-session-id'] || query?.session || 'default') as string;
+  return sessionManager.getOrCreate(id);
+}
 
 // Setup Elysia Server
 const app = new Elysia()
@@ -99,172 +35,131 @@ const app = new Elysia()
   .post(
     '/api/ingress',
     async ({ headers, body, set }) => {
-      const startTime = performance.now();
-
-      // 1. Rate Limiting Check (<0.1ms)
-      if (!rateLimiter.tryConsume(1)) {
-        metricsCollector.recordIngress(performance.now() - startTime);
-        metricsCollector.recordRateLimited();
-        set.status = 429;
-        return {
-          error: 'Too Many Requests',
-          code: 'RATE_LIMITED',
-          message: 'Ingress threshold exceeded. Token bucket depleted.',
-        };
-      }
-
-      // 2. Idempotency Key Deduplication Check (<0.1ms)
+      const session = getSession(headers);
       const idempotencyKey =
         (headers['idempotency-key'] as string) ||
         `gen-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-
-      const { isDuplicate } = idempotencyStore.checkAndRecord(idempotencyKey);
-      if (isDuplicate) {
-        metricsCollector.recordIngress(performance.now() - startTime);
-        metricsCollector.recordDuplicate();
-        set.status = 409;
-        return {
-          error: 'Conflict: Duplicate Request',
-          code: 'DUPLICATE_IDEMPOTENCY_KEY',
-          idempotencyKey,
-          message:
-            'Payload with identical Idempotency-Key previously registered within TTL window.',
-        };
-      }
-
-      // 3. Build Enqueued Ingress Event
       const incomingData = typeof body === 'object' && body !== null ? (body as any) : {};
-      const payload: IngressPayload = {
-        id: `ev_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
+      const result = session.handleIngress(
         idempotencyKey,
-        enqueuedAt: Date.now(),
-        schemaType: incomingData.schemaType || 'generic',
-        data: incomingData.data || incomingData,
-        attempts: 0,
-        maxAttempts: config.maxRetries,
-      };
-
-      // 4. Enqueue into Shock Absorber Buffer
-      const enqueued = bufferQueue.enqueue(payload);
-      const elapsedLatency = performance.now() - startTime;
-      metricsCollector.recordIngress(elapsedLatency);
-
-      if (!enqueued) {
-        set.status = 503;
-        return {
-          error: 'Buffer Overflow',
-          code: 'QUEUE_CAPACITY_EXCEEDED',
-          message: 'Shock absorber queue buffer is at maximum capacity.',
-        };
-      }
-
-      metricsCollector.recordAccepted();
-
-      // 5. Immediate 202 Accepted response (<10ms)
-      set.status = 202;
-      return {
-        status: 'accepted',
-        id: payload.id,
-        idempotencyKey: payload.idempotencyKey,
-        enqueuedAt: payload.enqueuedAt,
-        bufferDepth: bufferQueue.getDepth(),
-        ingressLatencyMs: Number(elapsedLatency.toFixed(3)),
-      };
+        incomingData.schemaType,
+        incomingData.data || incomingData,
+        session.config.maxRetries
+      );
+      set.status = result.status;
+      return result.body;
     },
     {
       headers: t.Object({
         'idempotency-key': t.Optional(t.String()),
+        'x-session-id': t.Optional(t.String()),
       }),
     }
   )
 
   // Traffic Generator API
-  .post('/api/traffic/start', ({ body }) => {
+  .post('/api/traffic/start', ({ headers, body }) => {
+    const session = getSession(headers as any);
     const customConfig = (body as any) || {};
-    return trafficClient.start(customConfig);
+    return session.trafficClient.start(customConfig);
   })
-  .post('/api/traffic/stop', () => {
-    return trafficClient.stop();
+  .post('/api/traffic/stop', ({ headers }) => {
+    const session = getSession(headers as any);
+    return session.trafficClient.stop();
   })
-  .get('/api/traffic/status', () => {
+  .get('/api/traffic/status', ({ headers, query }) => {
+    const session = getSession(headers as any, query as any);
     return {
-      active: trafficClient.isActive(),
-      config: trafficClient.getConfig(),
+      active: session.trafficClient.isActive(),
+      config: session.trafficClient.getConfig(),
     };
   })
 
   // Dead-Letter Queue (DLQ) Management
-  .get('/api/dlq', ({ query }) => {
-    const limit = Number(query.limit) || 50;
-    const offset = Number(query.offset) || 0;
-    return dlq.getItems(limit, offset);
+  .get('/api/dlq', ({ headers, query }) => {
+    const session = getSession(headers as any, query as any);
+    const limit = Number(query?.limit) || 50;
+    const offset = Number(query?.offset) || 0;
+    return session.dlq.getItems(limit, offset);
   })
-  .post('/api/dlq/replay', ({ body }) => {
+  .post('/api/dlq/replay', ({ headers, body }) => {
+    const session = getSession(headers as any);
     const req = (body as any) || {};
     if (req.id) {
-      const success = dlq.replay(req.id, bufferQueue);
+      const success = session.dlq.replay(req.id, session.bufferQueue);
       return { success, replayedCount: success ? 1 : 0 };
     }
-    // Replay all
-    const count = dlq.replayAll(bufferQueue);
+    const count = session.dlq.replayAll(session.bufferQueue);
     return { success: true, replayedCount: count };
   })
-  .delete('/api/dlq', () => {
-    const purgedCount = dlq.purge();
+  .delete('/api/dlq', ({ headers }) => {
+    const session = getSession(headers as any);
+    const purgedCount = session.dlq.purge();
     return { success: true, purgedCount };
   })
 
   // System Configuration API
-  .get('/api/config', () => {
-    return config;
+  .get('/api/config', ({ headers, query }) => {
+    const session = getSession(headers as any, query as any);
+    return session.config;
   })
-  .post('/api/config', ({ body }) => {
+  .post('/api/config', ({ headers, body }) => {
+    const session = getSession(headers as any);
     const newConfig = (body as any) || {};
-    Object.assign(config, newConfig);
+    Object.assign(session.config, newConfig);
 
     if (newConfig.rateLimitPerSec || newConfig.rateLimitBurst) {
-      rateLimiter.updateConfig(config.rateLimitPerSec, config.rateLimitBurst);
+      session.rateLimiter.updateConfig(
+        session.config.rateLimitPerSec,
+        session.config.rateLimitBurst
+      );
     }
     if (newConfig.bufferCapacity) {
-      bufferQueue.setCapacity(config.bufferCapacity);
+      session.bufferQueue.setCapacity(session.config.bufferCapacity);
     }
-    workerPool.updateConfig(config);
+    session.workerPool.updateConfig(session.config);
 
-    return { success: true, config };
+    return { success: true, config: session.config };
   })
 
   // Instantaneous Snapshot API
-  .get('/api/metrics', () => {
-    return metricsCollector.tick(
-      bufferQueue,
-      dlq,
-      workerPool.getWorkers(),
-      workerPool.getRoutingStrategy(),
-      trafficClient.isActive(),
-      trafficClient.getConfig().targetRps
+  .get('/api/metrics', ({ headers, query }) => {
+    const session = getSession(headers as any, query as any);
+    return session.metricsCollector.tick(
+      session.bufferQueue,
+      session.dlq,
+      session.workerPool.getWorkers(),
+      session.workerPool.getRoutingStrategy(),
+      session.trafficClient.isActive(),
+      session.trafficClient.getConfig().targetRps
     );
   })
 
-  // WebSocket for 250ms Live Telemetry Push
+  // WebSocket for 250ms Live Telemetry Push per Session
   .ws('/ws', {
     open(ws) {
-      telemetrySockets.add(ws);
-      // Immediately send initial frame
-      const initialFrame = metricsCollector.tick(
-        bufferQueue,
-        dlq,
-        workerPool.getWorkers(),
-        workerPool.getRoutingStrategy(),
-        trafficClient.isActive(),
-        trafficClient.getConfig().targetRps
+      const sessionId = ((ws.data.query as any)?.session as string) || 'default';
+      const session = sessionManager.getOrCreate(sessionId);
+      session.sockets.add(ws);
+      (ws as any)._sessionId = sessionId;
+
+      const initialFrame = session.metricsCollector.tick(
+        session.bufferQueue,
+        session.dlq,
+        session.workerPool.getWorkers(),
+        session.workerPool.getRoutingStrategy(),
+        session.trafficClient.isActive(),
+        session.trafficClient.getConfig().targetRps
       );
+      initialFrame.burstProgress = session.trafficClient.getProgress();
       ws.send(JSON.stringify(initialFrame));
     },
     close(ws) {
-      telemetrySockets.delete(ws);
+      const sessionId = (ws as any)._sessionId || 'default';
+      const session = sessionManager.getOrCreate(sessionId);
+      session.sockets.delete(ws);
     },
     message(ws, message) {
-      // Optional client commands over WS
       try {
         const cmd = typeof message === 'string' ? JSON.parse(message) : message;
         if (cmd?.type === 'PING') {
