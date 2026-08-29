@@ -40,7 +40,7 @@ export class IdempotencyStore {
   public has(key: string): boolean {
     const existing = this.cache.get(key);
     if (existing === undefined) return false;
-    return (Date.now() - existing) < this.ttlMs;
+    return Date.now() - existing < this.ttlMs;
   }
 
   public size(): number {

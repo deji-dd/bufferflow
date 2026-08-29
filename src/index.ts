@@ -1,14 +1,14 @@
-import { Elysia, t } from 'elysia';
 import { cors } from '@elysiajs/cors';
 import { staticPlugin } from '@elysiajs/static';
-import { TokenBucketRateLimiter } from './core/rate-limiter';
-import { IdempotencyStore } from './core/idempotency';
+import { Elysia, t } from 'elysia';
 import { BufferQueue } from './core/buffer-queue';
 import { DeadLetterQueue } from './core/dlq';
-import { WorkerPool } from './core/worker-pool';
+import { IdempotencyStore } from './core/idempotency';
 import { MetricsCollector } from './core/metrics';
+import { TokenBucketRateLimiter } from './core/rate-limiter';
 import { TrafficClient } from './core/traffic-client';
-import type { IngressPayload, RoutingStrategy, SystemConfig } from './core/types';
+import type { IngressPayload, SystemConfig } from './core/types';
+import { WorkerPool } from './core/worker-pool';
 
 const PORT = Number(process.env.PORT || 3001);
 
@@ -45,7 +45,7 @@ const workerPool = new WorkerPool({
 });
 
 // Link worker pool callbacks to metrics collector
-workerPool.setEventProcessedCallback((item, success, workerId) => {
+workerPool.setEventProcessedCallback((_item, success, _workerId) => {
   metricsCollector.recordJobProcessed(success);
 });
 
@@ -83,13 +83,17 @@ const app = new Elysia()
   .use(cors())
   .use(
     staticPlugin({
-      assets: 'public',
+      assets: 'dist',
       prefix: '',
     })
   )
 
-  // Serve index.html on root
-  .get('/', () => Bun.file('public/index.html'))
+  // Serve index.html on root (built bundle or dev fallback)
+  .get('/', async () => {
+    const distHtml = Bun.file('dist/index.html');
+    if (await distHtml.exists()) return distHtml;
+    return Bun.file('ui/index.html');
+  })
 
   // Ingress Gateway Endpoint
   .post(
@@ -123,7 +127,8 @@ const app = new Elysia()
           error: 'Conflict: Duplicate Request',
           code: 'DUPLICATE_IDEMPOTENCY_KEY',
           idempotencyKey,
-          message: 'Payload with identical Idempotency-Key previously registered within TTL window.',
+          message:
+            'Payload with identical Idempotency-Key previously registered within TTL window.',
         };
       }
 

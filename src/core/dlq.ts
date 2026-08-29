@@ -1,5 +1,5 @@
-import type { DLQItem, IngressPayload } from './types';
 import type { BufferQueue } from './buffer-queue';
+import type { DLQItem, IngressPayload } from './types';
 
 export class DeadLetterQueue {
   private items: DLQItem[] = [];

@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'bun:test';
-import { TokenBucketRateLimiter } from '../src/core/rate-limiter';
-import { IdempotencyStore } from '../src/core/idempotency';
 import { BufferQueue } from '../src/core/buffer-queue';
 import { DeadLetterQueue } from '../src/core/dlq';
-import { WorkerPool } from '../src/core/worker-pool';
+import { IdempotencyStore } from '../src/core/idempotency';
+import { TokenBucketRateLimiter } from '../src/core/rate-limiter';
 import type { IngressPayload } from '../src/core/types';
+import { WorkerPool } from '../src/core/worker-pool';
 
 describe('Bufferflow Core Engine Test Suite', () => {
   describe('1. Token Bucket Rate Limiter', () => {

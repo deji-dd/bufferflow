@@ -1,6 +1,6 @@
-import type { TelemetryFrame, WorkerInfo, RoutingStrategy } from './types';
 import type { BufferQueue } from './buffer-queue';
 import type { DeadLetterQueue } from './dlq';
+import type { RoutingStrategy, TelemetryFrame, WorkerInfo } from './types';
 
 export class MetricsCollector {
   // Rolling counts for the current window
@@ -101,7 +101,7 @@ export class MetricsCollector {
     if (this.latencySamples.length > 0) {
       this.latencySamples.sort((a, b) => a - b);
       const len = this.latencySamples.length;
-      this.p50Latency = Number((this.latencySamples[Math.floor(len * 0.50)] ?? 0).toFixed(2));
+      this.p50Latency = Number((this.latencySamples[Math.floor(len * 0.5)] ?? 0).toFixed(2));
       this.p95Latency = Number((this.latencySamples[Math.floor(len * 0.95)] ?? 0).toFixed(2));
       this.p99Latency = Number((this.latencySamples[Math.floor(len * 0.99)] ?? 0).toFixed(2));
       this.latencySamples = [];

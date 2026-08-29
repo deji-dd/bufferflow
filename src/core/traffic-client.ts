@@ -155,7 +155,7 @@ export class TrafficClient {
         customerId: `cust_${Math.floor(1000 + Math.random() * 9000)}`,
         items: [
           { sku: 'ITEM-X9', qty: Math.floor(1 + Math.random() * 4), price: 49.99 },
-          { sku: 'ITEM-Z1', qty: 1, price: 129.50 },
+          { sku: 'ITEM-Z1', qty: 1, price: 129.5 },
         ],
         totalAmount: Number((179.49 + Math.random() * 200).toFixed(2)),
         status: 'PENDING_CHECKOUT',

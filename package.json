@@ -5,9 +5,14 @@
   "main": "src/index.ts",
   "type": "module",
   "scripts": {
-    "start": "bun run src/index.ts",
     "dev": "bun --watch src/index.ts",
-    "test": "bun test"
+    "dev:ui": "vite",
+    "build": "vite build",
+    "start": "bun run src/index.ts",
+    "test": "bun test",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write ."
   },
   "dependencies": {
     "elysia": "latest",
@@ -15,6 +20,10 @@
     "@elysiajs/static": "latest"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@biomejs/biome": "latest",
+    "@tailwindcss/vite": "latest",
+    "@types/bun": "latest",
+    "tailwindcss": "latest",
+    "vite": "latest"
   }
 }

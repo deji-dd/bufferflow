@@ -1,6 +1,6 @@
-import type { CircuitState, IngressPayload, RoutingStrategy, WorkerInfo, WorkerState } from './types';
 import type { BufferQueue } from './buffer-queue';
 import type { DeadLetterQueue } from './dlq';
+import type { IngressPayload, RoutingStrategy, WorkerInfo } from './types';
 
 export interface WorkerPoolOptions {
   workerCount: number;
@@ -39,7 +39,9 @@ export class WorkerPool {
     this.initWorkers(options.workerCount);
   }
 
-  public setEventProcessedCallback(cb: (item: IngressPayload, success: boolean, workerId: string) => void) {
+  public setEventProcessedCallback(
+    cb: (item: IngressPayload, success: boolean, workerId: string) => void
+  ) {
     this.onEventProcessed = cb;
   }
 
@@ -140,9 +142,7 @@ export class WorkerPool {
    */
   private selectWorker(): WorkerInfo | null {
     // Eligible workers: circuit is not OPEN and activeJobs < concurrency limit (e.g. 50 per worker)
-    const eligible = this.workers.filter(
-      (w) => w.circuitState !== 'OPEN' && w.activeJobs < 50
-    );
+    const eligible = this.workers.filter((w) => w.circuitState !== 'OPEN' && w.activeJobs < 50);
 
     if (eligible.length === 0) return null;
 
@@ -160,7 +160,7 @@ export class WorkerPool {
       case 'WEIGHTED_ROUND_ROBIN': {
         // Build weighted pool or select using smooth weighted distribution
         const totalWeight = eligible.reduce((sum, w) => sum + w.weight, 0);
-        let randomWeight = (this.weightedCounter++ % totalWeight);
+        let randomWeight = this.weightedCounter++ % totalWeight;
         for (const worker of eligible) {
           if (randomWeight < worker.weight) {
             return worker;
@@ -169,8 +169,6 @@ export class WorkerPool {
         }
         return eligible[0];
       }
-
-      case 'ROUND_ROBIN':
       default: {
         const worker = eligible[this.rrIndex % eligible.length];
         this.rrIndex = (this.rrIndex + 1) % eligible.length;
@@ -224,7 +222,13 @@ export class WorkerPool {
     }
 
     if (isFailure) {
-      this.handleFailure(worker, item, queue, dlq, 'Downstream 500 Internal Server Error (Simulated Outage)');
+      this.handleFailure(
+        worker,
+        item,
+        queue,
+        dlq,
+        'Downstream 500 Internal Server Error (Simulated Outage)'
+      );
       if (this.onEventProcessed) this.onEventProcessed(item, false, worker.id);
     } else {
       this.handleSuccess(worker, item);
@@ -232,7 +236,7 @@ export class WorkerPool {
     }
   }
 
-  private handleSuccess(worker: WorkerInfo, item: IngressPayload): void {
+  private handleSuccess(worker: WorkerInfo, _item: IngressPayload): void {
     worker.totalProcessed++;
     worker.consecutiveFailures = 0;
 
@@ -259,7 +263,10 @@ export class WorkerPool {
     worker.consecutiveSuccesses = 0;
 
     // Circuit Breaker check
-    if (worker.circuitState === 'HALF_OPEN' || worker.consecutiveFailures >= this.circuitFailureThreshold) {
+    if (
+      worker.circuitState === 'HALF_OPEN' ||
+      worker.consecutiveFailures >= this.circuitFailureThreshold
+    ) {
       worker.circuitState = 'OPEN';
       worker.state = 'CIRCUIT_OPEN';
       worker.circuitTrippedAt = Date.now();
@@ -269,7 +276,7 @@ export class WorkerPool {
     item.attempts++;
     if (item.attempts < this.maxRetries) {
       // Re-enqueue with small exponential backoff
-      const backoffDelay = Math.min(1000, 50 * Math.pow(2, item.attempts));
+      const backoffDelay = Math.min(1000, 50 * 2 ** item.attempts);
       setTimeout(() => {
         queue.enqueue(item);
       }, backoffDelay);

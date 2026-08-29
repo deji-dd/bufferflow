@@ -7,6 +7,14 @@ FROM base AS dependencies
 COPY package.json bun.lock* ./
 RUN bun install --frozen-lockfile || bun install
 
+# Build static frontend
+FROM dependencies AS builder
+WORKDIR /app
+COPY package.json tsconfig.json vite.config.ts ./
+COPY ui ./ui
+COPY src ./src
+RUN bun run build
+
 # Production runner
 FROM base AS runner
 WORKDIR /app
@@ -15,10 +23,10 @@ ENV NODE_ENV=production
 ENV PORT=3001
 
 COPY --from=dependencies /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
 COPY package.json ./
 COPY tsconfig.json ./
 COPY src ./src
-COPY public ./public
 
 EXPOSE 3001
 
