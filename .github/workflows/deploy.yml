@@ -1,0 +1,58 @@
+name: Deploy Bufferflow to Cloud
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy Bufferflow to dejis-cloud
+    runs-on: ubuntu-latest
+    env:
+      SERVER_HOST: dejis-cloud
+      SERVER_USER: root
+      DEPLOY_DIR: /opt/bufferflow
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Setup Server Directories
+        run: |
+          ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_HOST} "bash -s" << EOF
+            set -euo pipefail
+            echo "Ensuring deployment directory exists..."
+            mkdir -p "${DEPLOY_DIR}"
+          EOF
+
+      - name: Sync Application Files
+        run: |
+          echo "Streaming repository files to ${SERVER_HOST}:${DEPLOY_DIR}..."
+          tar -czf - --exclude='.git' --exclude='.env' --exclude='.github' --exclude='node_modules' . | \
+            ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_HOST} \
+            "tar -xzf - -C ${DEPLOY_DIR}"
+
+      - name: Deploy Container with Docker Compose
+        run: |
+          ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_HOST} "bash -s" << EOF
+            set -euo pipefail
+            cd ${DEPLOY_DIR}
+            docker compose build --pull
+            docker compose up -d --remove-orphans
+            echo "Checking Bufferflow container status..."
+            docker compose ps
+          EOF
+
+      - name: Health Check Verification
+        run: |
+          ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_HOST} \
+            "curl -f --retry 5 --retry-delay 2 http://localhost:3001/api/traffic/status || exit 1"

@@ -1,0 +1,20 @@
+{
+  "name": "bufferflow",
+  "version": "1.0.0",
+  "description": "High-throughput ingress gateway, shock-absorbing queue buffer, dynamic worker pool with circuit breaking & DLQ",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "elysia": "latest",
+    "@elysiajs/cors": "latest",
+    "@elysiajs/static": "latest"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
