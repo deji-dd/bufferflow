@@ -1,4 +1,4 @@
-import { AlertTriangle, FileJson, Gauge, Layers, Moon, Sun } from 'lucide-react';
+import { AlertTriangle, FileJson, Gauge, History, Layers, Moon, Sun } from 'lucide-react';
 import type React from 'react';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -10,6 +10,8 @@ interface HeaderProps {
   onToggleTheme: () => void;
   hasResults?: boolean;
   onOpenResults?: () => void;
+  historyCount?: number;
+  onOpenHistory?: () => void;
   trafficActive?: boolean;
   dlqSize?: number;
   onOpenDlq?: () => void;
@@ -22,6 +24,8 @@ export const Header: React.FC<HeaderProps> = ({
   onToggleTheme,
   hasResults,
   onOpenResults,
+  historyCount = 0,
+  onOpenHistory,
   trafficActive = false,
   dlqSize = 0,
   onOpenDlq,
@@ -105,6 +109,25 @@ export const Header: React.FC<HeaderProps> = ({
             >
               <AlertTriangle className="size-3.5" />
               <span>DLQ ({dlqSize})</span>
+            </Button>
+          )}
+
+          {onOpenHistory && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={onOpenHistory}
+              className="font-mono font-bold gap-1.5 text-xs border-white/10 hover:border-[#00f0ff]/40 hover:text-[#00f0ff]"
+              title="View Historical Test Runs & Benchmarks"
+            >
+              <History className="size-3.5 text-[#00f0ff]" />
+              <span>HISTORY</span>
+              {historyCount > 0 && (
+                <span className="h-4 min-w-4 px-1 rounded-full bg-[#00f0ff]/20 text-[#00f0ff] text-[10px] flex items-center justify-center font-bold">
+                  {historyCount > 99 ? '99+' : historyCount}
+                </span>
+              )}
             </Button>
           )}
 

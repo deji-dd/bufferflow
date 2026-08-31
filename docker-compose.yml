@@ -10,6 +10,14 @@ services:
     environment:
       PORT: 3001
       NODE_ENV: production
+      POSTGRES_HOST: /var/run/postgresql
+      POSTGRES_DB: ${POSTGRES_DB:-dejis_cloud_db}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-bufferflow}
+    volumes:
+      # Host socket directory mounted to PostgreSQL standard socket directory for IPC
+      - /var/run/postgres-sockets:/var/run/postgresql
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://127.0.0.1:3001/api/traffic/status || exit 1"]
       interval: 60s

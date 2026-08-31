@@ -7,9 +7,15 @@ export class BufferQueue {
   private totalDequeued: number = 0;
   private totalDropped: number = 0;
 
+  private onEnqueueCallback?: () => void;
+
   constructor(capacity: number = 50000) {
     this.capacity = capacity;
     this.queue = [];
+  }
+
+  public setOnEnqueueCallback(cb: () => void): void {
+    this.onEnqueueCallback = cb;
   }
 
   public enqueue(item: IngressPayload): boolean {
@@ -19,6 +25,9 @@ export class BufferQueue {
     }
     this.queue.push(item);
     this.totalEnqueued++;
+    if (this.onEnqueueCallback) {
+      this.onEnqueueCallback();
+    }
     return true;
   }
 

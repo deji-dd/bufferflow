@@ -2,6 +2,13 @@ import { cors } from '@elysiajs/cors';
 import { staticPlugin } from '@elysiajs/static';
 import { Elysia, t } from 'elysia';
 import { SessionManager, type SimulationSession } from './core/simulation-session';
+import { initDb } from './db';
+import { historyRepository } from './db/repository';
+
+// Initialize PostgreSQL connection with automatic fallback for dev
+initDb().catch((err) => {
+  console.warn(`[Bufferflow DB] Startup initialization: ${err?.message}`);
+});
 
 const PORT = Number(process.env.PORT || 3001);
 const sessionManager = new SessionManager(PORT);
@@ -206,12 +213,39 @@ const app = new Elysia()
     return { success: true };
   })
 
-  // WebSocket for 250ms Live Telemetry Push per Session
+  // Historical Test Run Results API (Drizzle ORM + PostgreSQL Socket IPC / Dev Fallback)
+  .get('/api/history', async ({ query }) => {
+    const limit = Math.min(100, Math.max(1, Number(query?.limit) || 50));
+    const offset = Math.max(0, Number(query?.offset) || 0);
+    return historyRepository.listRuns(limit, offset);
+  })
+  .get('/api/history/:id', async ({ params, set }) => {
+    const run = await historyRepository.getRunById(params.id);
+    if (!run) {
+      set.status = 404;
+      return { error: 'Test run not found' };
+    }
+    return run;
+  })
+  .post('/api/history', async ({ body }) => {
+    const data = (body as any) || {};
+    if (data.runId) {
+      await historyRepository.saveTestRun(data);
+      return { success: true, runId: data.runId };
+    }
+    return { success: false, error: 'Invalid run data' };
+  })
+  .delete('/api/history/:id', async ({ params }) => {
+    const success = await historyRepository.deleteRun(params.id);
+    return { success };
+  })
+
+  // WebSocket for Live Telemetry Push per Session
   .ws('/ws', {
     open(ws) {
       const sessionId = ((ws.data.query as any)?.session as string) || 'default';
       const session = sessionManager.getOrCreate(sessionId);
-      session.sockets.add(ws);
+      session.addSocket(ws);
       (ws as any)._sessionId = sessionId;
 
       const initialFrame = session.metricsCollector.tick(
@@ -230,7 +264,7 @@ const app = new Elysia()
     close(ws) {
       const sessionId = (ws as any)._sessionId || 'default';
       const session = sessionManager.getOrCreate(sessionId);
-      session.sockets.delete(ws);
+      session.removeSocket(ws);
       // Safety fallback: if no client tabs connected, stop active traffic
       if (session.sockets.size === 0 && session.trafficClient.isActive()) {
         session.trafficClient.stop();

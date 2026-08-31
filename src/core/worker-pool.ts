@@ -25,6 +25,9 @@ export class WorkerPool {
 
   private isRunning: boolean = false;
   private dispatchTimer: any = null;
+  private isDispatchPending: boolean = false;
+  private activeQueue: BufferQueue | null = null;
+  private activeDlq: DeadLetterQueue | null = null;
   private rrCounter: number = 0;
   private weightedCounter: number = 0;
 
@@ -101,22 +104,34 @@ export class WorkerPool {
     }
   }
 
+  public wake(): void {
+    if (!this.isRunning || !this.activeQueue || !this.activeDlq) return;
+    if (this.isDispatchPending) return;
+
+    if (this.dispatchTimer) {
+      clearTimeout(this.dispatchTimer);
+      this.dispatchTimer = null;
+    }
+
+    this.isDispatchPending = true;
+    queueMicrotask(() => {
+      this.isDispatchPending = false;
+      this.dispatch();
+    });
+  }
+
   public start(queue: BufferQueue, dlq: DeadLetterQueue): void {
     if (this.isRunning) return;
     this.isRunning = true;
+    this.activeQueue = queue;
+    this.activeDlq = dlq;
 
-    // High frequency dispatch loop
-    const dispatch = () => {
-      if (!this.isRunning) return;
+    // Wake dispatch loop whenever new work is enqueued
+    queue.setOnEnqueueCallback(() => {
+      this.wake();
+    });
 
-      this.evaluateCircuits();
-      this.drainQueue(queue, dlq);
-
-      // Schedule next dispatch tick rapidly (1ms) to handle bursts
-      this.dispatchTimer = setTimeout(dispatch, 1);
-    };
-
-    dispatch();
+    this.dispatch();
   }
 
   public stop(): void {
@@ -125,6 +140,61 @@ export class WorkerPool {
       clearTimeout(this.dispatchTimer);
       this.dispatchTimer = null;
     }
+    if (this.activeQueue) {
+      this.activeQueue.setOnEnqueueCallback(() => {});
+      this.activeQueue = null;
+    }
+    this.activeDlq = null;
+  }
+
+  public hasEligibleWorkers(): boolean {
+    return this.workers.some((w) => {
+      if (w.circuitState === 'OPEN') return false;
+      if (w.circuitState === 'HALF_OPEN') return w.activeJobs === 0;
+      return w.activeJobs < this.maxConcurrencyPerWorker;
+    });
+  }
+
+  private dispatch(): void {
+    if (!this.isRunning || !this.activeQueue || !this.activeDlq) return;
+
+    if (this.dispatchTimer) {
+      clearTimeout(this.dispatchTimer);
+      this.dispatchTimer = null;
+    }
+
+    this.evaluateCircuits();
+    this.drainQueue(this.activeQueue, this.activeDlq);
+
+    const queueDepth = this.activeQueue.getDepth();
+    const hasEligible = this.hasEligibleWorkers();
+
+    if (queueDepth > 0 && hasEligible) {
+      // More items in queue and workers ready -> rapid micro-tick
+      this.dispatchTimer = setTimeout(() => this.dispatch(), 0);
+      return;
+    }
+
+    // Check if any circuits are in OPEN state to schedule earliest recovery transition
+    let earliestRecoveryDelay: number | null = null;
+    const now = Date.now();
+    for (const worker of this.workers) {
+      if (worker.circuitState === 'OPEN' && worker.circuitTrippedAt) {
+        const remaining = Math.max(10, worker.circuitTrippedAt + this.circuitRecoveryTimeMs - now);
+        if (earliestRecoveryDelay === null || remaining < earliestRecoveryDelay) {
+          earliestRecoveryDelay = remaining;
+        }
+      }
+    }
+
+    if (earliestRecoveryDelay !== null) {
+      this.dispatchTimer = setTimeout(() => this.dispatch(), earliestRecoveryDelay);
+      return;
+    }
+
+    // When idle (0 items, 0 eligible or idle workers, no open circuits),
+    // sleep with a relaxed 1000ms safety heartbeat. Any enqueue or job completion calls wake().
+    this.dispatchTimer = setTimeout(() => this.dispatch(), 1000);
   }
 
   /**
@@ -324,18 +394,22 @@ export class WorkerPool {
       worker.state = worker.circuitState === 'HALF_OPEN' ? 'HALF_OPEN' : 'IDLE';
     }
 
-    if (isFailure) {
-      this.handleFailure(
-        worker,
-        item,
-        queue,
-        dlq,
-        'Downstream 500 Internal Server Error (Simulated Outage)'
-      );
-      if (this.onEventProcessed) this.onEventProcessed(item, false, worker.id);
-    } else {
-      this.handleSuccess(worker, item);
-      if (this.onEventProcessed) this.onEventProcessed(item, true, worker.id);
+    try {
+      if (isFailure) {
+        this.handleFailure(
+          worker,
+          item,
+          queue,
+          dlq,
+          'Downstream 500 Internal Server Error (Simulated Outage)'
+        );
+        if (this.onEventProcessed) this.onEventProcessed(item, false, worker.id);
+      } else {
+        this.handleSuccess(worker, item);
+        if (this.onEventProcessed) this.onEventProcessed(item, true, worker.id);
+      }
+    } finally {
+      this.wake();
     }
   }
 

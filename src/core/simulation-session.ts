@@ -1,3 +1,4 @@
+import { historyRepository } from '../db/repository';
 import { BufferQueue } from './buffer-queue';
 import { DeadLetterQueue } from './dlq';
 import { IdempotencyStore } from './idempotency';
@@ -148,6 +149,7 @@ export class SimulationSession {
       const latencyMs = item?.enqueuedAt
         ? Math.max(0.5, now - item.enqueuedAt)
         : this.config.mockDownstreamLatencyMs;
+
       this.metricsCollector.recordJobProcessed(success, latencyMs);
 
       if (this.isSuiteRunning) {
@@ -170,34 +172,70 @@ export class SimulationSession {
     });
 
     this.workerPool.start(this.bufferQueue, this.dlq);
+  }
 
-    // 250ms Telemetry Broadcast Loop for this session
-    this.tickTimer = setInterval(() => {
-      if (this.sockets.size === 0) return;
-      this.lastActive = Date.now();
+  public addSocket(ws: any): void {
+    this.sockets.add(ws);
+    this.touch();
+    this.scheduleNextTick();
+  }
 
-      const frame = this.metricsCollector.tick(
-        this.bufferQueue,
-        this.dlq,
-        this.workerPool.getWorkers(),
-        this.workerPool.getRoutingStrategy(),
-        this.trafficClient.isActive(),
-        this.trafficClient.getConfig().targetRps
-      );
+  public removeSocket(ws: any): void {
+    this.sockets.delete(ws);
+    if (this.sockets.size === 0 && !this.isSuiteRunning && this.tickTimer) {
+      clearTimeout(this.tickTimer);
+      this.tickTimer = null;
+    }
+  }
 
-      if (this.isSuiteRunning) {
-        this.suitePeakIncomingRps = Math.max(this.suitePeakIncomingRps, frame.metrics.incomingRps);
-        this.suitePeakAcceptedRps = Math.max(this.suitePeakAcceptedRps, frame.metrics.acceptedRps);
-        this.suitePeakDrainedRps = Math.max(this.suitePeakDrainedRps, frame.metrics.drainedRps);
-      }
+  public scheduleNextTick(): void {
+    if (this.tickTimer) {
+      clearTimeout(this.tickTimer);
+      this.tickTimer = null;
+    }
+    if (this.sockets.size === 0 && !this.isSuiteRunning) return;
 
-      frame.burstProgress = this.trafficClient.getProgress();
-      frame.suiteProgress = this.getSuiteProgress();
-      frame.isServerRunningTest = this.isSuiteRunning;
-      if (this.lastCompletedSuiteResults) {
-        frame.suiteResults = this.lastCompletedSuiteResults;
-      }
+    const isBusy =
+      this.trafficClient.isActive() ||
+      this.isSuiteRunning ||
+      this.bufferQueue.getDepth() > 0 ||
+      this.workerPool.getActiveJobCount() > 0;
 
+    const delay = isBusy ? 250 : 1000;
+
+    this.tickTimer = setTimeout(() => {
+      this.broadcastTelemetry();
+      this.scheduleNextTick();
+    }, delay);
+  }
+
+  public broadcastTelemetry(): void {
+    if (this.sockets.size === 0 && !this.isSuiteRunning) return;
+    this.lastActive = Date.now();
+
+    const frame = this.metricsCollector.tick(
+      this.bufferQueue,
+      this.dlq,
+      this.workerPool.getWorkers(),
+      this.workerPool.getRoutingStrategy(),
+      this.trafficClient.isActive(),
+      this.trafficClient.getConfig().targetRps
+    );
+
+    if (this.isSuiteRunning) {
+      this.suitePeakIncomingRps = Math.max(this.suitePeakIncomingRps, frame.metrics.incomingRps);
+      this.suitePeakAcceptedRps = Math.max(this.suitePeakAcceptedRps, frame.metrics.acceptedRps);
+      this.suitePeakDrainedRps = Math.max(this.suitePeakDrainedRps, frame.metrics.drainedRps);
+    }
+
+    frame.burstProgress = this.trafficClient.getProgress();
+    frame.suiteProgress = this.getSuiteProgress();
+    frame.isServerRunningTest = this.isSuiteRunning;
+    if (this.lastCompletedSuiteResults) {
+      frame.suiteResults = this.lastCompletedSuiteResults;
+    }
+
+    if (this.sockets.size > 0) {
       const str = JSON.stringify(frame);
       for (const ws of this.sockets) {
         try {
@@ -206,7 +244,7 @@ export class SimulationSession {
           this.sockets.delete(ws);
         }
       }
-    }, 250);
+    }
   }
 
   public handleIngress(
@@ -643,6 +681,9 @@ export class SimulationSession {
     };
 
     this.lastCompletedSuiteResults = results;
+    historyRepository.saveTestRun(results).catch((err) => {
+      console.warn(`[Bufferflow History] Failed to save suite results: ${err?.message}`);
+    });
     return results;
   }
 

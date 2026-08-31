@@ -6,6 +6,7 @@ import { DagPipeline } from './components/DagPipeline';
 import { DlqModal } from './components/DlqModal';
 import { Footer } from './components/Footer';
 import { Header } from './components/Header';
+import { HistoryModal } from './components/HistoryModal';
 import { KpiGrid } from './components/KpiGrid';
 import { ResultsModal, type TestRunResults } from './components/ResultsModal';
 import { type ChartDataPoint, ThroughputChart } from './components/ThroughputChart';
@@ -61,6 +62,8 @@ export const App: React.FC = () => {
   const [isServerRunningTest, setIsServerRunningTest] = useState<boolean>(false);
   const [dlqModalOpen, setDlqModalOpen] = useState<boolean>(false);
   const [resultsModalOpen, setResultsModalOpen] = useState<boolean>(false);
+  const [historyModalOpen, setHistoryModalOpen] = useState<boolean>(false);
+  const [historyCount, setHistoryCount] = useState<number>(0);
   const [latestResults, setLatestResults] = useState<TestRunResults | null>(null);
 
   const [trafficConfig, setTrafficConfig] = useState<TrafficConfig>({
@@ -88,6 +91,31 @@ export const App: React.FC = () => {
   const peakAcceptedRpsRef = useRef<number>(0);
   const peakDrainedRpsRef = useRef<number>(0);
 
+  const refreshHistoryCount = useCallback(() => {
+    fetch('/api/history?limit=1')
+      .then((r) => r.json())
+      .then((data) => {
+        if (data && typeof data.total === 'number') {
+          setHistoryCount(data.total);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  const handleSelectHistoricalRun = useCallback(async (runId: string) => {
+    try {
+      const res = await fetch(`/api/history/${encodeURIComponent(runId)}`);
+      const data = await res.json();
+      if (data && !data.error) {
+        setLatestResults(data);
+        setHistoryModalOpen(false);
+        setResultsModalOpen(true);
+      }
+    } catch (err) {
+      console.warn('Failed to load historical run:', err);
+    }
+  }, []);
+
   // Keep refs in sync for event listeners
   trafficActiveRef.current = trafficActive;
   trafficConfigRef.current = trafficConfig;
@@ -109,7 +137,9 @@ export const App: React.FC = () => {
         }
       })
       .catch(() => {});
-  }, []);
+
+    refreshHistoryCount();
+  }, [refreshHistoryCount]);
 
   const handleToggleTheme = () => {
     const isCurrentlyLight = document.documentElement.classList.toggle('light');
@@ -207,8 +237,15 @@ export const App: React.FC = () => {
       const results = buildRunResults(reason);
       setLatestResults(results);
       setResultsModalOpen(true);
+      fetch('/api/history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(results),
+      })
+        .then(() => refreshHistoryCount())
+        .catch(() => {});
     },
-    [addLog, buildRunResults]
+    [addLog, buildRunResults, refreshHistoryCount]
   );
 
   // WebSocket Connection per Session
@@ -330,6 +367,13 @@ export const App: React.FC = () => {
               const results = buildRunResults('completed', frame.metrics, frame.workers);
               setLatestResults(results);
               setResultsModalOpen(true);
+              fetch('/api/history', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(results),
+              })
+                .then(() => refreshHistoryCount())
+                .catch(() => {});
             }
           } else {
             setTrafficActive(frame.trafficActive);
@@ -688,6 +732,8 @@ export const App: React.FC = () => {
           onToggleTheme={handleToggleTheme}
           hasResults={!!latestResults}
           onOpenResults={() => setResultsModalOpen(true)}
+          historyCount={historyCount}
+          onOpenHistory={() => setHistoryModalOpen(true)}
           trafficActive={trafficActive}
           dlqSize={metrics.dlqSize}
           onOpenDlq={() => setDlqModalOpen(true)}
@@ -745,6 +791,15 @@ export const App: React.FC = () => {
         isOpen={resultsModalOpen}
         results={latestResults}
         onClose={() => setResultsModalOpen(false)}
+      />
+
+      <HistoryModal
+        isOpen={historyModalOpen}
+        onClose={() => {
+          setHistoryModalOpen(false);
+          refreshHistoryCount();
+        }}
+        onSelectRun={handleSelectHistoricalRun}
       />
     </>
   );
