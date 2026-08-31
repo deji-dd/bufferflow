@@ -14,7 +14,10 @@
     "allowSyntheticDefaultImports": true,
     "forceConsistentCasingInFileNames": true,
     "allowJs": false,
-    "types": ["bun-types"]
+    "types": ["bun-types"],
+    "paths": {
+      "@/*": ["./ui/src/*"]
+    }
   },
   "include": ["src/**/*", "ui/src/**/*", "test/**/*"]
 }

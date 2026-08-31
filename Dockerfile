@@ -19,6 +19,8 @@ RUN bun run build
 FROM base AS runner
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+
 ENV NODE_ENV=production
 ENV PORT=3001
 
@@ -29,9 +31,5 @@ COPY tsconfig.json ./
 COPY src ./src
 
 EXPOSE 3001
-
-# Healthcheck
-HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
-  CMD bun -e "fetch('http://127.0.0.1:3001/api/traffic/status').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 CMD ["bun", "run", "src/index.ts"]

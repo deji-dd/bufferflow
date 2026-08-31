@@ -1,13 +1,12 @@
 import type React from 'react';
+import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from 'recharts';
+import { Card } from '@/components/ui/card';
 import {
-  Area,
-  AreaChart,
-  CartesianGrid,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from 'recharts';
+  type ChartConfig,
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+} from '@/components/ui/chart';
 
 export interface ChartDataPoint {
   time: string;
@@ -26,45 +25,31 @@ interface ThroughputChartProps {
   bufferCapacity?: number;
 }
 
-interface TooltipPayloadItem {
-  dataKey: string;
-  name: string;
-  value: number | string;
-  stroke: string;
-  color?: string;
-}
+const throughputChartConfig = {
+  incoming: {
+    label: 'Ingress RPS',
+    color: '#00f0ff',
+  },
+  accepted: {
+    label: 'Accepted RPS',
+    color: '#a855f7',
+  },
+  drained: {
+    label: 'Drained RPS',
+    color: '#10b981',
+  },
+} satisfies ChartConfig;
 
-interface CustomTooltipProps {
-  active?: boolean;
-  payload?: TooltipPayloadItem[];
-  label?: string;
-}
-
-const CustomTooltip: React.FC<CustomTooltipProps> = ({ active, payload, label }) => {
-  if (!active || !payload?.length) return null;
-
-  return (
-    <div className="bg-[#0a0f1d]/95 backdrop-blur-md border border-white/10 rounded-xl p-3 shadow-2xl text-xs font-mono">
-      <div className="text-[#64748b] text-[10px] mb-1.5">{label}</div>
-      <div className="flex flex-col gap-1">
-        {payload.map((entry) => (
-          <div key={entry.dataKey} className="flex justify-between items-center gap-4">
-            <span className="flex items-center gap-1.5 text-[#94a3b8]">
-              <span
-                className="w-2 h-2 rounded-full"
-                style={{ backgroundColor: entry.stroke || entry.color }}
-              />
-              {entry.name}:
-            </span>
-            <span className="font-semibold text-white">
-              {typeof entry.value === 'number' ? entry.value.toLocaleString() : entry.value}
-            </span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-};
+const bufferChartConfig = {
+  bufferDepth: {
+    label: 'Queue Backlog',
+    color: '#a855f7',
+  },
+  p95Latency: {
+    label: 'P95 Latency',
+    color: '#00f0ff',
+  },
+} satisfies ChartConfig;
 
 export const ThroughputChart: React.FC<ThroughputChartProps> = ({
   data,
@@ -78,7 +63,7 @@ export const ThroughputChart: React.FC<ThroughputChartProps> = ({
 
   // 2. Buffer depth fixed ceiling: statically stepped based on burst configuration
   // Never auto-adjusts or jumps while traffic is running!
-  const burstVolume = targetRps * durationSec;
+  const burstVolume = targetRps * (durationSec > 0 ? durationSec : 25);
   let bufferCeiling = 10000;
   if (burstVolume <= 15000) {
     bufferCeiling = 5000;
@@ -96,9 +81,11 @@ export const ThroughputChart: React.FC<ThroughputChartProps> = ({
   return (
     <div className="flex flex-col gap-4 min-w-0">
       {/* Chart 1: Throughput Dynamics */}
-      <div className="glass-card rounded-2xl p-5 min-w-0">
+      <Card className="p-5 min-w-0">
         <div className="flex justify-between items-center mb-3 flex-wrap gap-2">
-          <h3 className="text-sm font-bold text-white uppercase">Throughput Dynamics</h3>
+          <h3 className="text-sm font-bold text-white uppercase tracking-wide">
+            Throughput Dynamics
+          </h3>
           <div className="flex items-center gap-3 text-xs text-[#94a3b8]">
             <span className="flex items-center gap-1.5">
               <span className="w-2.5 h-2.5 rounded-full bg-[#00f0ff]" /> Ingress
@@ -112,83 +99,90 @@ export const ThroughputChart: React.FC<ThroughputChartProps> = ({
           </div>
         </div>
 
-        <div className="relative w-full h-[180px]">
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={data} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-              <defs>
-                <linearGradient id="gradIngress" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#00f0ff" stopOpacity={0.45} />
-                  <stop offset="95%" stopColor="#00f0ff" stopOpacity={0.0} />
-                </linearGradient>
-                <linearGradient id="gradAccepted" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#a855f7" stopOpacity={0.45} />
-                  <stop offset="95%" stopColor="#a855f7" stopOpacity={0.0} />
-                </linearGradient>
-                <linearGradient id="gradDrained" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#10b981" stopOpacity={0.45} />
-                  <stop offset="95%" stopColor="#10b981" stopOpacity={0.0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid
-                strokeDasharray="3 3"
-                stroke="rgba(255, 255, 255, 0.05)"
-                vertical={false}
-              />
-              <XAxis
-                dataKey="time"
-                stroke="#64748b"
-                fontSize={10}
-                tickLine={false}
-                axisLine={false}
-              />
-              <YAxis
-                stroke="#64748b"
-                fontSize={10}
-                tickLine={false}
-                axisLine={false}
-                domain={[0, throughputCeiling]}
-                allowDataOverflow={false}
-              />
-              <Tooltip content={<CustomTooltip />} />
-              <Area
-                type="monotone"
-                dataKey="incoming"
-                name="Ingress RPS"
-                stroke="#00f0ff"
-                strokeWidth={2}
-                fillOpacity={1}
-                fill="url(#gradIngress)"
-                isAnimationActive={false}
-              />
-              <Area
-                type="monotone"
-                dataKey="accepted"
-                name="Accepted RPS"
-                stroke="#a855f7"
-                strokeWidth={2}
-                fillOpacity={1}
-                fill="url(#gradAccepted)"
-                isAnimationActive={false}
-              />
-              <Area
-                type="monotone"
-                dataKey="drained"
-                name="Drained RPS"
-                stroke="#10b981"
-                strokeWidth={2}
-                fillOpacity={1}
-                fill="url(#gradDrained)"
-                isAnimationActive={false}
-              />
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
-      </div>
+        <ChartContainer config={throughputChartConfig} className="aspect-auto h-[220px] w-full">
+          <AreaChart data={data} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+            <defs>
+              <linearGradient id="gradIngress" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor="#00f0ff" stopOpacity={0.45} />
+                <stop offset="95%" stopColor="#00f0ff" stopOpacity={0.0} />
+              </linearGradient>
+              <linearGradient id="gradAccepted" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor="#a855f7" stopOpacity={0.45} />
+                <stop offset="95%" stopColor="#a855f7" stopOpacity={0.0} />
+              </linearGradient>
+              <linearGradient id="gradDrained" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor="#10b981" stopOpacity={0.45} />
+                <stop offset="95%" stopColor="#10b981" stopOpacity={0.0} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid
+              strokeDasharray="3 3"
+              stroke="rgba(255, 255, 255, 0.05)"
+              vertical={false}
+            />
+            <XAxis
+              dataKey="time"
+              stroke="#64748b"
+              fontSize={10}
+              tickLine={false}
+              axisLine={false}
+            />
+            <YAxis
+              stroke="#64748b"
+              fontSize={10}
+              tickLine={false}
+              axisLine={false}
+              domain={[0, throughputCeiling]}
+              allowDataOverflow={false}
+            />
+            <ChartTooltip
+              content={
+                <ChartTooltipContent
+                  className="bg-popover/95 text-popover-foreground border border-border/80 rounded-xl p-3 shadow-2xl backdrop-blur-md text-xs font-mono"
+                  labelClassName="text-muted-foreground text-[10px]"
+                />
+              }
+            />
+            <Area
+              type="monotone"
+              dataKey="incoming"
+              name="Ingress RPS"
+              stroke="#00f0ff"
+              strokeWidth={2}
+              fillOpacity={1}
+              fill="url(#gradIngress)"
+              isAnimationActive={false}
+            />
+            <Area
+              type="monotone"
+              dataKey="accepted"
+              name="Accepted RPS"
+              stroke="#a855f7"
+              strokeWidth={2}
+              fillOpacity={1}
+              fill="url(#gradAccepted)"
+              isAnimationActive={false}
+            />
+            <Area
+              type="monotone"
+              dataKey="drained"
+              name="Drained RPS"
+              stroke="#10b981"
+              strokeWidth={2}
+              fillOpacity={1}
+              fill="url(#gradDrained)"
+              isAnimationActive={false}
+            />
+          </AreaChart>
+        </ChartContainer>
+      </Card>
 
       {/* Chart 2: Buffer Depth & Latency SLA */}
-      <div className="glass-card rounded-2xl p-5 min-w-0">
+      <Card className="p-5 min-w-0">
         <div className="flex justify-between items-center mb-3 flex-wrap gap-2">
-          <h3 className="text-sm font-bold text-white uppercase">Buffer Depth &amp; Latency SLA</h3>
+          <h3 className="text-sm font-bold text-white uppercase tracking-wide">
+            Buffer Depth &amp; Latency SLA
+          </h3>
           <div className="flex items-center gap-3 text-xs text-[#94a3b8]">
             <span className="flex items-center gap-1.5">
               <span className="w-2.5 h-2.5 rounded-full bg-[#a855f7]" /> Queue Backlog
@@ -199,78 +193,83 @@ export const ThroughputChart: React.FC<ThroughputChartProps> = ({
           </div>
         </div>
 
-        <div className="relative w-full h-[180px]">
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={data} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-              <defs>
-                <linearGradient id="gradBuffer" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#a855f7" stopOpacity={0.45} />
-                  <stop offset="95%" stopColor="#a855f7" stopOpacity={0.0} />
-                </linearGradient>
-                <linearGradient id="gradLatency" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#00f0ff" stopOpacity={0.35} />
-                  <stop offset="95%" stopColor="#00f0ff" stopOpacity={0.0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid
-                strokeDasharray="3 3"
-                stroke="rgba(255, 255, 255, 0.05)"
-                vertical={false}
-              />
-              <XAxis
-                dataKey="time"
-                stroke="#64748b"
-                fontSize={10}
-                tickLine={false}
-                axisLine={false}
-              />
-              <YAxis
-                yAxisId="left"
-                stroke="#64748b"
-                fontSize={10}
-                tickLine={false}
-                axisLine={false}
-                domain={[0, bufferCeiling]}
-                allowDataOverflow={false}
-                tickFormatter={(v: number) => (v >= 1000 ? `${(v / 1000).toFixed(0)}k` : `${v}`)}
-              />
-              <YAxis
-                yAxisId="right"
-                orientation="right"
-                stroke="#64748b"
-                fontSize={10}
-                tickLine={false}
-                axisLine={false}
-                domain={[0, latencyCeiling]}
-                allowDataOverflow={false}
-                unit="ms"
-              />
-              <Tooltip content={<CustomTooltip />} />
-              <Area
-                yAxisId="left"
-                type="monotone"
-                dataKey="bufferDepth"
-                name="Buffer Depth"
-                stroke="#a855f7"
-                strokeWidth={2}
-                fillOpacity={1}
-                fill="url(#gradBuffer)"
-                isAnimationActive={false}
-              />
-              <Area
-                yAxisId="right"
-                type="monotone"
-                dataKey="p95Latency"
-                name="P95 Latency"
-                stroke="#00f0ff"
-                strokeWidth={2}
-                fill="none"
-                isAnimationActive={false}
-              />
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
-      </div>
+        <ChartContainer config={bufferChartConfig} className="aspect-auto h-[220px] w-full">
+          <AreaChart data={data} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+            <defs>
+              <linearGradient id="gradBuffer" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor="#a855f7" stopOpacity={0.45} />
+                <stop offset="95%" stopColor="#a855f7" stopOpacity={0.0} />
+              </linearGradient>
+              <linearGradient id="gradLatency" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor="#00f0ff" stopOpacity={0.35} />
+                <stop offset="95%" stopColor="#00f0ff" stopOpacity={0.0} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid
+              strokeDasharray="3 3"
+              stroke="rgba(255, 255, 255, 0.05)"
+              vertical={false}
+            />
+            <XAxis
+              dataKey="time"
+              stroke="#64748b"
+              fontSize={10}
+              tickLine={false}
+              axisLine={false}
+            />
+            <YAxis
+              yAxisId="left"
+              stroke="#64748b"
+              fontSize={10}
+              tickLine={false}
+              axisLine={false}
+              domain={[0, bufferCeiling]}
+              allowDataOverflow={false}
+              tickFormatter={(v: number) => (v >= 1000 ? `${(v / 1000).toFixed(0)}k` : `${v}`)}
+            />
+            <YAxis
+              yAxisId="right"
+              orientation="right"
+              stroke="#64748b"
+              fontSize={10}
+              tickLine={false}
+              axisLine={false}
+              domain={[0, latencyCeiling]}
+              allowDataOverflow={false}
+              unit="ms"
+            />
+            <ChartTooltip
+              content={
+                <ChartTooltipContent
+                  className="bg-popover/95 text-popover-foreground border border-border/80 rounded-xl p-3 shadow-2xl backdrop-blur-md text-xs font-mono"
+                  labelClassName="text-muted-foreground text-[10px]"
+                />
+              }
+            />
+            <Area
+              yAxisId="left"
+              type="monotone"
+              dataKey="bufferDepth"
+              name="Buffer Depth"
+              stroke="#a855f7"
+              strokeWidth={2}
+              fillOpacity={1}
+              fill="url(#gradBuffer)"
+              isAnimationActive={false}
+            />
+            <Area
+              yAxisId="right"
+              type="monotone"
+              dataKey="p95Latency"
+              name="P95 Latency"
+              stroke="#00f0ff"
+              strokeWidth={2}
+              fill="none"
+              isAnimationActive={false}
+            />
+          </AreaChart>
+        </ChartContainer>
+      </Card>
     </div>
   );
 };

@@ -10,6 +10,7 @@ export interface WorkerPoolOptions {
   maxRetries: number;
   mockDownstreamLatencyMs: number;
   mockDownstreamFailureRate: number;
+  maxConcurrencyPerWorker?: number;
 }
 
 export class WorkerPool {
@@ -20,10 +21,11 @@ export class WorkerPool {
   private maxRetries: number;
   private mockLatencyMs: number;
   private mockFailureRate: number;
+  private maxConcurrencyPerWorker: number;
 
   private isRunning: boolean = false;
   private dispatchTimer: any = null;
-  private rrIndex: number = 0;
+  private rrCounter: number = 0;
   private weightedCounter: number = 0;
 
   private onEventProcessed?: (item: IngressPayload, success: boolean, workerId: string) => void;
@@ -35,6 +37,7 @@ export class WorkerPool {
     this.maxRetries = options.maxRetries;
     this.mockLatencyMs = options.mockDownstreamLatencyMs;
     this.mockFailureRate = options.mockDownstreamFailureRate;
+    this.maxConcurrencyPerWorker = options.maxConcurrencyPerWorker ?? 25;
 
     this.initWorkers(options.workerCount);
   }
@@ -93,6 +96,9 @@ export class WorkerPool {
     if (config.mockDownstreamFailureRate !== undefined) {
       this.mockFailureRate = config.mockDownstreamFailureRate;
     }
+    if (config.maxConcurrencyPerWorker !== undefined) {
+      this.maxConcurrencyPerWorker = config.maxConcurrencyPerWorker;
+    }
   }
 
   public start(queue: BufferQueue, dlq: DeadLetterQueue): void {
@@ -138,11 +144,56 @@ export class WorkerPool {
   }
 
   /**
+   * Reset worker counters when starting a new test run.
+   */
+  public resetCounters(): void {
+    this.rrCounter = 0;
+    this.weightedCounter = 0;
+    for (const worker of this.workers) {
+      worker.totalProcessed = 0;
+      worker.totalFailed = 0;
+      worker.consecutiveFailures = 0;
+      worker.consecutiveSuccesses = 0;
+      worker.circuitState = 'CLOSED';
+      worker.state = worker.activeJobs > 0 ? 'BUSY' : 'IDLE';
+      worker.circuitTrippedAt = undefined;
+    }
+  }
+
+  /**
+   * Cleans up transient failures and resets rotation counters when switching strategy phases.
+   */
+  public resetStrategyWindow(): void {
+    this.rrCounter = 0;
+    this.weightedCounter = 0;
+    for (const worker of this.workers) {
+      worker.consecutiveFailures = 0;
+      worker.consecutiveSuccesses = 0;
+      if (worker.circuitState !== 'CLOSED') {
+        worker.circuitState = 'CLOSED';
+        worker.state = worker.activeJobs > 0 ? 'BUSY' : 'IDLE';
+        worker.circuitTrippedAt = undefined;
+      }
+    }
+  }
+
+  public getActiveJobCount(): number {
+    return this.workers.reduce((sum, w) => sum + w.activeJobs, 0);
+  }
+
+  /**
    * Selects an available worker according to the active routing strategy.
    */
-  private selectWorker(): WorkerInfo | null {
-    // Eligible workers: circuit is not OPEN and activeJobs < concurrency limit (e.g. 50 per worker)
-    const eligible = this.workers.filter((w) => w.circuitState !== 'OPEN' && w.activeJobs < 50);
+  private selectWorker(item?: IngressPayload): WorkerInfo | null {
+    // Eligible workers:
+    // - If circuit is CLOSED: activeJobs < concurrency limit
+    // - If circuit is HALF_OPEN: only 1 probe job at a time (activeJobs === 0)
+    // - If circuit is OPEN: ineligible
+    const eligible = this.workers.filter((w) => {
+      if (w.circuitState === 'OPEN') return false;
+      if (w.circuitState === 'HALF_OPEN') return w.activeJobs === 0;
+      return w.activeJobs < this.maxConcurrencyPerWorker;
+    });
 
     if (eligible.length === 0) return null;
 
@@ -169,9 +220,60 @@ export class WorkerPool {
         }
         return eligible[0];
       }
+
+      case 'WEIGHTED_LEAST_CONNECTIONS': {
+        // Balances active connections by worker weight capacity
+        let best = eligible[0];
+        let bestScore = best.activeJobs / Math.max(1, best.weight);
+        for (let i = 1; i < eligible.length; i++) {
+          const score = eligible[i].activeJobs / Math.max(1, eligible[i].weight);
+          if (score < bestScore) {
+            best = eligible[i];
+            bestScore = score;
+          }
+        }
+        return best;
+      }
+
+      case 'POWER_OF_TWO_CHOICES': {
+        // Mitzenmacher's P2C: pick 2 random workers, select the least loaded
+        if (eligible.length <= 2) {
+          return eligible[0].activeJobs <= (eligible[1]?.activeJobs ?? Infinity)
+            ? eligible[0]
+            : eligible[1];
+        }
+        const idx1 = Math.floor(Math.random() * eligible.length);
+        let idx2 = Math.floor(Math.random() * (eligible.length - 1));
+        if (idx2 >= idx1) idx2++;
+        const w1 = eligible[idx1];
+        const w2 = eligible[idx2];
+        return w1.activeJobs <= w2.activeJobs ? w1 : w2;
+      }
+
+      case 'RANDOM': {
+        // Uniform random selection among healthy workers
+        return eligible[Math.floor(Math.random() * eligible.length)];
+      }
+
+      case 'CONSISTENT_HASH': {
+        // Deterministic hash mod eligible workers for key/session affinity
+        const key = item?.idempotencyKey || item?.id || 'default';
+        let hash = 0;
+        for (let i = 0; i < key.length; i++) {
+          hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+        }
+        return eligible[hash % eligible.length];
+      }
+
+      case 'ROUND_ROBIN': {
+        const worker = eligible[this.rrCounter % eligible.length];
+        this.rrCounter = (this.rrCounter + 1) >>> 0;
+        return worker;
+      }
+
       default: {
-        const worker = eligible[this.rrIndex % eligible.length];
-        this.rrIndex = (this.rrIndex + 1) % eligible.length;
+        const worker = eligible[this.rrCounter % eligible.length];
+        this.rrCounter = (this.rrCounter + 1) >>> 0;
         return worker;
       }
     }
@@ -184,12 +286,13 @@ export class WorkerPool {
     // Process up to 50 items per dispatch cycle to prevent starvation
     let iterations = 0;
     while (queue.getDepth() > 0 && iterations < 50) {
-      const worker = this.selectWorker();
-      if (!worker) break; // All workers busy or in OPEN circuit
-
-      const item = queue.dequeue();
+      const item = queue.peek();
       if (!item) break;
 
+      const worker = this.selectWorker(item);
+      if (!worker) break; // All workers busy or in OPEN circuit
+
+      queue.dequeue();
       this.executeJob(worker, item, queue, dlq);
       iterations++;
     }
@@ -242,11 +345,12 @@ export class WorkerPool {
 
     if (worker.circuitState === 'HALF_OPEN') {
       worker.consecutiveSuccesses++;
-      if (worker.consecutiveSuccesses >= 3) {
-        // Fully recover circuit
+      if (worker.consecutiveSuccesses >= 2) {
+        // Fully recover circuit to CLOSED
         worker.circuitState = 'CLOSED';
         worker.state = worker.activeJobs > 0 ? 'BUSY' : 'IDLE';
         worker.circuitTrippedAt = undefined;
+        worker.consecutiveFailures = 0;
       }
     }
   }

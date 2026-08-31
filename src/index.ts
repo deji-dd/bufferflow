@@ -61,18 +61,59 @@ const app = new Elysia()
   .post('/api/traffic/start', ({ headers, body }) => {
     const session = getSession(headers as any);
     const customConfig = (body as any) || {};
+    // "history" should clear on new test start
+    session.resetRunHistory();
     return session.trafficClient.start(customConfig);
   })
-  .post('/api/traffic/stop', ({ headers }) => {
+  .post('/api/traffic/full-test', ({ headers, body }) => {
     const session = getSession(headers as any);
-    return session.trafficClient.stop();
+    const req = (body as any) || {};
+    return session.startFullSuiteTest({
+      stepDurationSec: Number(req.stepDurationSec) || 5,
+      targetRps: Number(req.targetRps) || 3500,
+      downstreamLatencyMs:
+        req.downstreamLatencyMs !== undefined ? Number(req.downstreamLatencyMs) : undefined,
+      failureRate: req.failureRate !== undefined ? Number(req.failureRate) : undefined,
+      idempotencyCollisionRate:
+        req.idempotencyCollisionRate !== undefined
+          ? Number(req.idempotencyCollisionRate)
+          : undefined,
+      workerCount: req.workerCount !== undefined ? Number(req.workerCount) : undefined,
+      stressLevel: req.stressLevel !== undefined ? Number(req.stressLevel) : undefined,
+      runAllLevels: req.runAllLevels !== undefined ? Boolean(req.runAllLevels) : undefined,
+    });
+  })
+  .post('/api/traffic/stop', ({ headers, query }) => {
+    const session = getSession(headers as any, query as any);
+    const suiteResults = session.stopFullSuiteTest('stopped_by_user');
+    const stopResult = session.trafficClient.stop();
+    return {
+      ...stopResult,
+      suiteResults,
+    };
+  })
+  .get('/api/traffic/stop', ({ headers, query }) => {
+    const session = getSession(headers as any, query as any);
+    const suiteResults = session.stopFullSuiteTest('safety_fallback_unload');
+    const stopResult = session.trafficClient.stop();
+    return {
+      ...stopResult,
+      suiteResults,
+    };
   })
   .get('/api/traffic/status', ({ headers, query }) => {
     const session = getSession(headers as any, query as any);
     return {
       active: session.trafficClient.isActive(),
       config: session.trafficClient.getConfig(),
+      isServerRunningTest: session.isServerRunningSuite(),
+      suiteProgress: session.getSuiteProgress(),
+      suiteResults: session.getLastSuiteResults(),
     };
+  })
+  .get('/api/traffic/suite-results', ({ headers, query }) => {
+    const session = getSession(headers as any, query as any);
+    return session.getLastSuiteResults() || { error: 'No suite test results available' };
   })
 
   // Dead-Letter Queue (DLQ) Management
@@ -101,10 +142,24 @@ const app = new Elysia()
   // System Configuration API
   .get('/api/config', ({ headers, query }) => {
     const session = getSession(headers as any, query as any);
-    return session.config;
+    return {
+      ...session.config,
+      isLocked: session.isServerRunningSuite(),
+    };
   })
-  .post('/api/config', ({ headers, body }) => {
+  .post('/api/config', ({ headers, body, set }) => {
     const session = getSession(headers as any);
+
+    // User is not able to edit settings if it's "server" doing the test
+    if (session.isServerRunningSuite()) {
+      set.status = 403;
+      return {
+        success: false,
+        error: 'Settings are locked while server full suite test is in progress.',
+        locked: true,
+      };
+    }
+
     const newConfig = (body as any) || {};
     Object.assign(session.config, newConfig);
 
@@ -118,6 +173,17 @@ const app = new Elysia()
       session.bufferQueue.setCapacity(session.config.bufferCapacity);
     }
     session.workerPool.updateConfig(session.config);
+
+    // Controls should affect ops live: forward live parameters to running traffic client
+    session.trafficClient.updateConfig({
+      targetRps: newConfig.targetRps,
+      durationSec: newConfig.durationSec,
+      isUnlimited: newConfig.isUnlimited,
+      schemaType: newConfig.schemaType,
+      failureRate: newConfig.failureRate ?? newConfig.mockDownstreamFailureRate,
+      downstreamLatencyMs: newConfig.downstreamLatencyMs ?? newConfig.mockDownstreamLatencyMs,
+      idempotencyCollisionRate: newConfig.idempotencyCollisionRate,
+    });
 
     return { success: true, config: session.config };
   })
@@ -133,6 +199,11 @@ const app = new Elysia()
       session.trafficClient.isActive(),
       session.trafficClient.getConfig().targetRps
     );
+  })
+  .post('/api/metrics/reset', ({ headers, query }) => {
+    const session = getSession(headers as any, query as any);
+    session.resetRunHistory();
+    return { success: true };
   })
 
   // WebSocket for 250ms Live Telemetry Push per Session
@@ -152,12 +223,18 @@ const app = new Elysia()
         session.trafficClient.getConfig().targetRps
       );
       initialFrame.burstProgress = session.trafficClient.getProgress();
+      initialFrame.suiteProgress = session.getSuiteProgress();
+      initialFrame.isServerRunningTest = session.isServerRunningSuite();
       ws.send(JSON.stringify(initialFrame));
     },
     close(ws) {
       const sessionId = (ws as any)._sessionId || 'default';
       const session = sessionManager.getOrCreate(sessionId);
       session.sockets.delete(ws);
+      // Safety fallback: if no client tabs connected, stop active traffic
+      if (session.sockets.size === 0 && session.trafficClient.isActive()) {
+        session.trafficClient.stop();
+      }
     },
     message(ws, message) {
       try {
@@ -173,8 +250,8 @@ const app = new Elysia()
 
   .listen(PORT);
 
-console.log(`🚀 Bufferflow Engine online at http://localhost:${PORT}`);
-console.log(`📊 Ingress Endpoint: POST http://localhost:${PORT}/api/ingress`);
-console.log(`📡 WebSocket Telemetry: ws://localhost:${PORT}/ws`);
+console.log(`Bufferflow online at http://localhost:${PORT}`);
+console.log(`Ingress Endpoint: POST http://localhost:${PORT}/api/ingress`);
+console.log(`WebSocket Telemetry: ws://localhost:${PORT}/ws`);
 
 export type App = typeof app;

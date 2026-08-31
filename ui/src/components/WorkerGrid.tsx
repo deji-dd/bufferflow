@@ -1,4 +1,5 @@
 import type React from 'react';
+import { Badge } from '@/components/ui/badge';
 import type { TelemetryFrame } from '../../../src/core/types';
 
 interface WorkerGridProps {
@@ -16,9 +17,9 @@ export const WorkerGrid: React.FC<WorkerGridProps> = ({ workers, routingStrategy
           </h2>
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-xs font-mono px-2.5 py-1 rounded bg-[#10b981]/10 text-[#10b981] border border-[#10b981]/30">
+          <Badge variant="emerald" className="text-xs font-mono">
             {routingStrategy.replace('_', ' ')}
-          </span>
+          </Badge>
         </div>
       </div>
 
@@ -26,13 +27,6 @@ export const WorkerGrid: React.FC<WorkerGridProps> = ({ workers, routingStrategy
         {workers.map((w) => {
           const concurrencyLimit = 20;
           const loadPct = Math.min(100, Math.round((w.activeJobs / concurrencyLimit) * 100));
-
-          let badgeColor = 'bg-[#10b981]/20 text-[#10b981] border-[#10b981]/40';
-          if (w.circuitState === 'OPEN') {
-            badgeColor = 'bg-[#f43f5e]/20 text-[#f43f5e] border-[#f43f5e]/40 animate-pulse';
-          } else if (w.circuitState === 'HALF_OPEN') {
-            badgeColor = 'bg-[#f59e0b]/20 text-[#f59e0b] border-[#f59e0b]/40';
-          }
 
           return (
             <div
@@ -52,11 +46,20 @@ export const WorkerGrid: React.FC<WorkerGridProps> = ({ workers, routingStrategy
                   />
                   {w.name}
                 </div>
-                <span
-                  className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded border ${badgeColor}`}
+                <Badge
+                  variant={
+                    w.circuitState === 'OPEN'
+                      ? 'rose'
+                      : w.circuitState === 'HALF_OPEN'
+                        ? 'amber'
+                        : 'emerald'
+                  }
+                  className={`text-[10px] font-mono font-bold px-1.5 py-0 ${
+                    w.circuitState === 'OPEN' ? 'animate-pulse' : ''
+                  }`}
                 >
                   {w.circuitState}
-                </span>
+                </Badge>
               </div>
 
               <div>

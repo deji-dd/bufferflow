@@ -48,32 +48,93 @@ export class TrafficClient {
     }
 
     this.currentConfig = { ...this.currentConfig, ...config };
+    if (config.isUnlimited || this.currentConfig.durationSec <= 0) {
+      this.currentConfig.durationSec = 0;
+      this.currentConfig.isUnlimited = true;
+    }
     this.isRunning = true;
     this.sentCount = 0;
     this.recentKeys = [];
     this.burstStartTime = Date.now();
 
     const targetRps = Math.max(10, this.currentConfig.targetRps);
-    // Dispatch every 25ms in batches: batchSize = targetRps * 0.025
-    const tickIntervalMs = 25;
-    const batchSize = Math.max(1, Math.round((targetRps * tickIntervalMs) / 1000));
+    this.startPacer();
 
-    this.intervalTimer = setInterval(() => {
-      if (!this.isRunning) return;
-      this.dispatchBatch(batchSize);
-    }, tickIntervalMs);
-
-    // Auto-stop after durationSec
-    if (this.currentConfig.durationSec > 0) {
+    // Auto-stop after durationSec if not unlimited
+    if (this.currentConfig.durationSec > 0 && !this.currentConfig.isUnlimited) {
       this.autoStopTimer = setTimeout(() => {
         this.stop();
       }, this.currentConfig.durationSec * 1000);
     }
 
+    const durationLabel =
+      this.currentConfig.isUnlimited || this.currentConfig.durationSec <= 0
+        ? 'unlimited duration'
+        : `${this.currentConfig.durationSec}s`;
+
     return {
       success: true,
-      message: `Traffic client started: targeting ${targetRps} req/s for ${this.currentConfig.durationSec}s`,
+      message: `Traffic client started: targeting ${targetRps} req/s for ${durationLabel}`,
     };
+  }
+
+  private startPacer(): void {
+    if (this.intervalTimer) {
+      clearInterval(this.intervalTimer);
+      this.intervalTimer = null;
+    }
+
+    let accumulatedTokens = 0;
+    let lastTick = performance.now();
+    const tickIntervalMs = 20;
+
+    this.intervalTimer = setInterval(() => {
+      if (!this.isRunning) return;
+      const now = performance.now();
+      const deltaSec = Math.max(0, (now - lastTick) / 1000);
+      lastTick = now;
+      accumulatedTokens += deltaSec * this.currentConfig.targetRps;
+      const countToSend = Math.floor(accumulatedTokens);
+      if (countToSend > 0) {
+        accumulatedTokens -= countToSend;
+        this.dispatchBatch(countToSend);
+      }
+    }, tickIntervalMs);
+  }
+
+  public updateConfig(config: Partial<TrafficConfig>): void {
+    this.currentConfig = { ...this.currentConfig, ...config };
+
+    if (config.isUnlimited !== undefined) {
+      if (config.isUnlimited) {
+        this.currentConfig.durationSec = 0;
+        this.currentConfig.isUnlimited = true;
+        if (this.autoStopTimer) {
+          clearTimeout(this.autoStopTimer);
+          this.autoStopTimer = null;
+        }
+      } else {
+        this.currentConfig.isUnlimited = false;
+      }
+    }
+
+    if (this.isRunning && config.targetRps !== undefined) {
+      this.startPacer();
+    }
+
+    if (this.isRunning && config.durationSec !== undefined && !this.currentConfig.isUnlimited) {
+      if (this.autoStopTimer) {
+        clearTimeout(this.autoStopTimer);
+        this.autoStopTimer = null;
+      }
+      if (config.durationSec > 0) {
+        const elapsedMs = Date.now() - this.burstStartTime;
+        const remainingMs = Math.max(0, config.durationSec * 1000 - elapsedMs);
+        this.autoStopTimer = setTimeout(() => {
+          this.stop();
+        }, remainingMs);
+      }
+    }
   }
 
   public stop(): { success: boolean; totalSent: number } {
@@ -98,27 +159,28 @@ export class TrafficClient {
   }
 
   public getProgress(): BurstProgress {
+    const isUnlimited = !!(this.currentConfig.isUnlimited || this.currentConfig.durationSec <= 0);
     if (!this.isRunning) {
       return {
         active: false,
         elapsedSec: 0,
         durationSec: this.currentConfig.durationSec,
         pct: 0,
+        isUnlimited,
       };
     }
-    const elapsed = Math.min(
-      this.currentConfig.durationSec,
-      Math.floor((Date.now() - this.burstStartTime) / 1000)
-    );
-    const pct =
-      this.currentConfig.durationSec > 0
+    const elapsed = Math.floor((Date.now() - this.burstStartTime) / 1000);
+    const pct = isUnlimited
+      ? 100
+      : this.currentConfig.durationSec > 0
         ? Math.min(100, Math.round((elapsed / this.currentConfig.durationSec) * 100))
         : 100;
     return {
       active: true,
-      elapsedSec: elapsed,
+      elapsedSec: isUnlimited ? elapsed : Math.min(this.currentConfig.durationSec, elapsed),
       durationSec: this.currentConfig.durationSec,
       pct,
+      isUnlimited,
     };
   }
 
@@ -205,12 +267,14 @@ export class TrafficClient {
       },
     };
 
+    const schemaKey = ((this.currentConfig.schemaType as keyof typeof payloadByType) ||
+      'ecommerce') as keyof typeof payloadByType;
     return {
       key,
       payload: {
-        schemaType: this.currentConfig.schemaType,
+        schemaType: schemaKey,
         timestamp: Date.now(),
-        data: payloadByType[this.currentConfig.schemaType],
+        data: payloadByType[schemaKey] || payloadByType.ecommerce,
       },
     };
   }

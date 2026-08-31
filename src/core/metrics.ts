@@ -2,6 +2,17 @@ import type { BufferQueue } from './buffer-queue';
 import type { DeadLetterQueue } from './dlq';
 import type { RoutingStrategy, TelemetryFrame, WorkerInfo } from './types';
 
+export function computePercentiles(samples: number[]): { p50: number; p95: number; p99: number } {
+  if (!samples || samples.length === 0) return { p50: 0, p95: 0, p99: 0 };
+  const sorted = [...samples].sort((a, b) => a - b);
+  const len = sorted.length;
+  return {
+    p50: Number((sorted[Math.floor(len * 0.5)] ?? 0).toFixed(2)),
+    p95: Number((sorted[Math.floor(len * 0.95)] ?? 0).toFixed(2)),
+    p99: Number((sorted[Math.floor(len * 0.99)] ?? 0).toFixed(2)),
+  };
+}
+
 export class MetricsCollector {
   // Rolling counts for the current window
   private windowIncoming: number = 0;
@@ -12,7 +23,9 @@ export class MetricsCollector {
 
   // Latency samples for percentile calculation (ms)
   private latencySamples: number[] = [];
-  private maxLatencySamples: number = 1000;
+  private cumulativeSamples: number[] = [];
+  private maxLatencySamples: number = 2000;
+  private maxCumulativeSamples: number = 5000;
 
   // Cumulative counters
   private totalIngressed: number = 0;
@@ -33,17 +46,9 @@ export class MetricsCollector {
 
   private lastTickTime: number = performance.now();
 
-  public recordIngress(latencyMs: number): void {
+  public recordIngress(_latencyMs: number): void {
     this.windowIncoming++;
     this.totalIngressed++;
-
-    if (this.latencySamples.length < this.maxLatencySamples) {
-      this.latencySamples.push(latencyMs);
-    } else {
-      // Overwrite random sample to maintain bounded reservoir
-      const idx = Math.floor(Math.random() * this.maxLatencySamples);
-      this.latencySamples[idx] = latencyMs;
-    }
   }
 
   public recordAccepted(): void {
@@ -59,12 +64,27 @@ export class MetricsCollector {
     this.windowDuplicates++;
   }
 
-  public recordJobProcessed(success: boolean): void {
+  public recordJobProcessed(success: boolean, latencyMs?: number): void {
     this.windowDrained++;
     if (success) {
       this.totalProcessed++;
     } else {
       this.totalFailed++;
+    }
+    if (latencyMs !== undefined && latencyMs > 0) {
+      if (this.latencySamples.length < this.maxLatencySamples) {
+        this.latencySamples.push(latencyMs);
+      } else {
+        const idx = Math.floor(Math.random() * this.maxLatencySamples);
+        this.latencySamples[idx] = latencyMs;
+      }
+
+      if (this.cumulativeSamples.length < this.maxCumulativeSamples) {
+        this.cumulativeSamples.push(latencyMs);
+      } else {
+        const idx = Math.floor(Math.random() * this.maxCumulativeSamples);
+        this.cumulativeSamples[idx] = latencyMs;
+      }
     }
   }
 
@@ -98,11 +118,10 @@ export class MetricsCollector {
     this.windowDrained = 0;
 
     if (this.latencySamples.length > 0) {
-      this.latencySamples.sort((a, b) => a - b);
-      const len = this.latencySamples.length;
-      this.p50Latency = Number((this.latencySamples[Math.floor(len * 0.5)] ?? 0).toFixed(2));
-      this.p95Latency = Number((this.latencySamples[Math.floor(len * 0.95)] ?? 0).toFixed(2));
-      this.p99Latency = Number((this.latencySamples[Math.floor(len * 0.99)] ?? 0).toFixed(2));
+      const { p50, p95, p99 } = computePercentiles(this.latencySamples);
+      this.p50Latency = p50;
+      this.p95Latency = p95;
+      this.p99Latency = p99;
       this.latencySamples = [];
     } else if (!trafficActive && this.currentIncomingRps === 0) {
       this.p50Latency = 0;
@@ -140,11 +159,35 @@ export class MetricsCollector {
     };
   }
 
+  public getCumulativeTotals() {
+    const { p50, p95, p99 } = computePercentiles(this.cumulativeSamples);
+    return {
+      totalIngressed: this.totalIngressed,
+      totalAccepted: this.totalAccepted,
+      totalProcessed: this.totalProcessed,
+      totalFailed: this.totalFailed,
+      p50LatencyMs: p50 || this.p50Latency,
+      p95LatencyMs: p95 || this.p95Latency,
+      p99LatencyMs: p99 || this.p99Latency,
+    };
+  }
+
+  public resetLatencySamples(): void {
+    this.latencySamples = [];
+    this.p50Latency = 0;
+    this.p95Latency = 0;
+    this.p99Latency = 0;
+  }
+
   public reset(): void {
     this.totalIngressed = 0;
     this.totalAccepted = 0;
     this.totalProcessed = 0;
     this.totalFailed = 0;
     this.latencySamples = [];
+    this.cumulativeSamples = [];
+    this.p50Latency = 0;
+    this.p95Latency = 0;
+    this.p99Latency = 0;
   }
 }

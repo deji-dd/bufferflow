@@ -1,6 +1,13 @@
 export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 
-export type RoutingStrategy = 'LEAST_CONNECTIONS' | 'WEIGHTED_ROUND_ROBIN' | 'ROUND_ROBIN';
+export type RoutingStrategy =
+  | 'LEAST_CONNECTIONS'
+  | 'WEIGHTED_ROUND_ROBIN'
+  | 'ROUND_ROBIN'
+  | 'RANDOM'
+  | 'POWER_OF_TWO_CHOICES'
+  | 'WEIGHTED_LEAST_CONNECTIONS'
+  | 'CONSISTENT_HASH';
 
 export type WorkerState = 'IDLE' | 'BUSY' | 'CIRCUIT_OPEN' | 'HALF_OPEN';
 
@@ -39,8 +46,9 @@ export interface DLQItem {
 
 export interface TrafficConfig {
   targetRps: number;
-  durationSec: number;
-  schemaType: 'fintech' | 'iot' | 'ecommerce';
+  durationSec: number; // 0 = unlimited
+  isUnlimited?: boolean;
+  schemaType?: string;
   failureRate: number; // 0 to 100 percentage of downstream failures
   downstreamLatencyMs: number; // downstream simulated latency
   idempotencyCollisionRate: number; // percentage of requests that reuse keys
@@ -64,6 +72,85 @@ export interface BurstProgress {
   elapsedSec: number;
   durationSec: number;
   pct: number;
+  isUnlimited?: boolean;
+}
+
+export interface SuiteProgress {
+  active: boolean;
+  currentStrategy: RoutingStrategy;
+  currentLevel?: number;
+  totalLevels?: number;
+  currentIndex: number;
+  totalStrategies: number;
+  stepDurationSec: number;
+  totalDurationSec: number;
+  elapsedSec: number;
+  pct: number;
+  strategyResults?: Record<
+    string,
+    {
+      totalProcessed: number;
+      totalFailed: number;
+      avgDrainedRps: number;
+    }
+  >;
+}
+
+export interface StrategyBenchmark {
+  strategy: RoutingStrategy;
+  durationSec: number;
+  ingressed: number;
+  accepted: number;
+  processed: number;
+  failed: number;
+  avgThroughputRps: number;
+  p95LatencyMs: number;
+  workerDistribution: Record<string, number>;
+}
+
+export interface FullSuiteResults {
+  testType: 'FULL_SUITE';
+  runId: string;
+  sessionId: string;
+  startedAt: string;
+  completedAt: string;
+  durationSec: number;
+  isMultiLevel?: boolean;
+  levelsTested?: number[];
+  levelBreakdowns?: Record<number, Record<string, StrategyBenchmark>>;
+  completedReason:
+    | 'completed'
+    | 'stopped_by_user'
+    | 'safety_fallback_blur'
+    | 'safety_fallback_unload';
+  config: {
+    targetRps: number;
+    durationSec: number;
+    isUnlimited?: boolean;
+    schemaType?: string;
+    failureRate: number;
+    downstreamLatencyMs: number;
+    idempotencyCollisionRate: number;
+    workerCount: number;
+    routingStrategy: string;
+  };
+  strategiesTested: RoutingStrategy[];
+  strategyBreakdown: Record<string, StrategyBenchmark>;
+  summary: {
+    totalIngressed: number;
+    totalAccepted: number;
+    totalProcessed: number;
+    totalFailed: number;
+    peakIncomingRps: number;
+    peakAcceptedRps: number;
+    peakDrainedRps: number;
+    p50LatencyMs: number;
+    p95LatencyMs: number;
+    p99LatencyMs: number;
+    finalBufferDepth: number;
+    finalDlqSize: number;
+  };
+  workers: WorkerInfo[];
 }
 
 export interface TelemetryFrame {
@@ -71,6 +158,9 @@ export interface TelemetryFrame {
   trafficActive: boolean;
   activeTargetRps: number;
   burstProgress?: BurstProgress;
+  suiteProgress?: SuiteProgress;
+  isServerRunningTest?: boolean;
+  suiteResults?: FullSuiteResults;
   metrics: {
     incomingRps: number;
     acceptedRps: number;

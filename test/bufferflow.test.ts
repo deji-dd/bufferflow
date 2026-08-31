@@ -129,7 +129,7 @@ describe('Bufferflow Core Engine Test Suite', () => {
     });
   });
 
-  describe('5. Worker Pool & Circuit Breaker', () => {
+  describe('5. Worker Pool & Routing Strategies', () => {
     it('dispatches to workers with least connections routing', () => {
       const pool = new WorkerPool({
         workerCount: 4,
@@ -144,6 +144,172 @@ describe('Bufferflow Core Engine Test Suite', () => {
       const workers = pool.getWorkers();
       expect(workers.length).toBe(4);
       expect(workers[0].circuitState).toBe('CLOSED');
+    });
+
+    it('supports all extended routing strategies without error', async () => {
+      const strategies = [
+        'LEAST_CONNECTIONS',
+        'WEIGHTED_ROUND_ROBIN',
+        'ROUND_ROBIN',
+        'RANDOM',
+        'POWER_OF_TWO_CHOICES',
+        'WEIGHTED_LEAST_CONNECTIONS',
+        'CONSISTENT_HASH',
+      ] as const;
+
+      for (const strategy of strategies) {
+        const pool = new WorkerPool({
+          workerCount: 4,
+          routingStrategy: strategy,
+          circuitFailureThreshold: 3,
+          circuitRecoveryTimeMs: 1000,
+          maxRetries: 3,
+          mockDownstreamLatencyMs: 2,
+          mockDownstreamFailureRate: 0,
+        });
+
+        const queue = new BufferQueue(10);
+        const dlq = new DeadLetterQueue(10);
+
+        queue.enqueue({
+          id: `item-${strategy}`,
+          idempotencyKey: `key-${strategy}`,
+          enqueuedAt: Date.now(),
+          schemaType: 'ecommerce',
+          data: { test: true },
+          attempts: 0,
+          maxAttempts: 3,
+        });
+
+        pool.start(queue, dlq);
+        await new Promise((r) => setTimeout(r, 20));
+        pool.stop();
+
+        expect(queue.getDepth()).toBe(0);
+      }
+    });
+
+    it('resets worker counters with resetCounters()', () => {
+      const pool = new WorkerPool({
+        workerCount: 2,
+        routingStrategy: 'ROUND_ROBIN',
+        circuitFailureThreshold: 3,
+        circuitRecoveryTimeMs: 1000,
+        maxRetries: 3,
+        mockDownstreamLatencyMs: 2,
+        mockDownstreamFailureRate: 0,
+      });
+
+      const workers = pool.getWorkers();
+      workers[0].totalProcessed = 100;
+      workers[0].totalFailed = 10;
+      pool.resetCounters();
+
+      const resetWorkers = pool.getWorkers();
+      expect(resetWorkers[0].totalProcessed).toBe(0);
+      expect(resetWorkers[0].totalFailed).toBe(0);
+    });
+  });
+
+  describe('6. Traffic Client Dynamics & Unlimited Mode', () => {
+    it('supports unlimited duration and live config updates', async () => {
+      const dispatched: any[] = [];
+      const { TrafficClient } = await import('../src/core/traffic-client');
+      const client = new TrafficClient('http://127.0.0.1:3001/api/ingress', 'test', (k, p) => {
+        dispatched.push({ k, p });
+      });
+
+      // Start with unlimited duration (durationSec = 0)
+      client.start({ targetRps: 200, durationSec: 0, isUnlimited: true });
+      expect(client.isActive()).toBe(true);
+
+      const progress = client.getProgress();
+      expect(progress.isUnlimited).toBe(true);
+
+      // Live update targetRps
+      client.updateConfig({ targetRps: 400 });
+      expect(client.getConfig().targetRps).toBe(400);
+
+      await new Promise((r) => setTimeout(r, 50));
+      expect(dispatched.length).toBeGreaterThan(0);
+
+      const stopResult = client.stop();
+      expect(stopResult.success).toBe(true);
+      expect(client.isActive()).toBe(false);
+    });
+  });
+
+  describe('7. Server Full Suite Stress Test', () => {
+    it('executes server suite test across strategies and tracks progress', async () => {
+      const { SimulationSession } = await import('../src/core/simulation-session');
+      const session = new SimulationSession('suite-test', 3001);
+
+      // Start full suite test with fast step duration (1s per step)
+      const res = session.startFullSuiteTest(1, 500);
+      expect(res.success).toBe(true);
+      expect(session.isServerRunningSuite()).toBe(true);
+
+      const progress = session.getSuiteProgress();
+      expect(progress).toBeDefined();
+      expect(progress?.active).toBe(true);
+      expect(progress?.totalStrategies).toBe(7);
+      expect(progress?.currentStrategy).toBe('LEAST_CONNECTIONS');
+
+      // Stop suite test and verify compiled results
+      const suiteResults = session.stopFullSuiteTest();
+      expect(session.isServerRunningSuite()).toBe(false);
+      expect(session.getSuiteProgress()).toBeUndefined();
+      expect(suiteResults).toBeDefined();
+      expect(suiteResults?.testType).toBe('FULL_SUITE');
+      expect(suiteResults?.strategiesTested).toContain('LEAST_CONNECTIONS');
+      expect(suiteResults?.strategyBreakdown.LEAST_CONNECTIONS).toBeDefined();
+      expect(suiteResults?.config.routingStrategy).toBe('ALL_7_STRATEGIES');
+      expect(suiteResults?.config.targetRps).toBe(500);
+      session.destroy();
+    });
+
+    it('executes server suite test with custom stress intensity options', async () => {
+      const { SimulationSession } = await import('../src/core/simulation-session');
+      const session = new SimulationSession('suite-stress-test', 3001);
+
+      const res = session.startFullSuiteTest({
+        stepDurationSec: 1,
+        targetRps: 4000,
+        downstreamLatencyMs: 40,
+        failureRate: 15,
+        stressLevel: 2,
+      });
+      expect(res.success).toBe(true);
+      expect(session.isServerRunningSuite()).toBe(true);
+
+      const suiteResults = session.stopFullSuiteTest();
+      expect(suiteResults?.config.targetRps).toBe(4000);
+      expect(suiteResults?.config.downstreamLatencyMs).toBe(40);
+      expect(suiteResults?.config.failureRate).toBe(15);
+      session.destroy();
+    });
+
+    it('supports automated matrix test across all 4 levels and purges buffer between steps', async () => {
+      const { SimulationSession } = await import('../src/core/simulation-session');
+      const session = new SimulationSession('matrix-test', 3001);
+
+      const res = session.startFullSuiteTest({
+        stepDurationSec: 2,
+        runAllLevels: true,
+      });
+      expect(res.success).toBe(true);
+      expect(session.isServerRunningSuite()).toBe(true);
+
+      const progress = session.getSuiteProgress();
+      expect(progress?.totalLevels).toBe(4);
+      expect(progress?.totalStrategies).toBe(28);
+      expect(progress?.currentLevel).toBe(1);
+
+      const suiteResults = session.stopFullSuiteTest();
+      expect(suiteResults?.isMultiLevel).toBe(true);
+      expect(suiteResults?.levelsTested).toEqual([1, 2, 3, 4]);
+      expect(suiteResults?.levelBreakdowns).toBeDefined();
+      session.destroy();
     });
   });
 });
