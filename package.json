@@ -5,16 +5,19 @@
   "main": "src/index.ts",
   "type": "module",
   "scripts": {
-    "dev": "bun --watch src/index.ts",
-    "dev:ui": "vite",
-    "build": "vite build",
-    "start": "bun run src/index.ts",
+    "dev": "NODE_ENV=development bun --watch src/index.ts",
+    "dev:ui": "NODE_ENV=development vite",
+    "build": "NODE_ENV=production vite build",
+    "start": "NODE_ENV=production bun run src/index.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
-    "sync:env": "bash scripts/sync-env.sh"
+    "sync:env": "bash scripts/sync-env.sh",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "bun run src/db/migrate.ts",
+    "db:push": "drizzle-kit push"
   },
   "dependencies": {
     "@dagrejs/dagre": "^3.1.1",
@@ -44,6 +47,7 @@
     "@types/react": "latest",
     "@types/react-dom": "latest",
     "@vitejs/plugin-react": "latest",
+    "drizzle-kit": "^0.31.10",
     "tailwindcss": "latest",
     "typescript": "latest",
     "vite": "latest"

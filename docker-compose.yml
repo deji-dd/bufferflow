@@ -11,10 +11,9 @@ services:
       PORT: 3001
       NODE_ENV: production
       POSTGRES_HOST: /var/run/postgresql
-      POSTGRES_DB: ${POSTGRES_DB:-dejis_cloud_db}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-bufferflow_db}
+      POSTGRES_USER: ${POSTGRES_USER:-bufferflow_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-bufferflow}
     volumes:
       # Host socket directory mounted to PostgreSQL standard socket directory for IPC
       - /var/run/postgres-sockets:/var/run/postgresql

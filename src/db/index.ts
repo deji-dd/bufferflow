@@ -1,5 +1,7 @@
 import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { drizzle } from 'drizzle-orm/postgres-js';
+import { migrate } from 'drizzle-orm/postgres-js/migrator';
 import postgres from 'postgres';
 import * as schema from './schema';
 
@@ -9,7 +11,6 @@ export interface DbConfig {
   database?: string;
   username?: string;
   password?: string;
-  schema?: string;
 }
 
 let dbInstance: ReturnType<typeof drizzle<typeof schema>> | null = null;
@@ -32,23 +33,26 @@ export async function initDb(): Promise<boolean> {
   if (isInitialized) return isConnectedToPostgres;
   isInitialized = true;
 
-  const schemaName = schema.SCHEMA_NAME;
   const isProd = process.env.NODE_ENV === 'production';
   const customUrl = process.env.DATABASE_URL;
 
-  // Detect socket availability or explicit host configuration
-  const defaultSocketDir = '/var/run/postgresql';
-  const hasDefaultSocket = existsSync(defaultSocketDir);
-  const host = process.env.POSTGRES_HOST || (hasDefaultSocket ? defaultSocketDir : undefined);
-  const database = process.env.POSTGRES_DB || 'dejis_cloud_db';
-  const username = process.env.POSTGRES_USER || 'postgres';
+  // Detect socket availability across Linux (/var/run/postgresql) and macOS (/tmp)
+  const defaultSocketDir = existsSync('/var/run/postgresql')
+    ? '/var/run/postgresql'
+    : existsSync('/tmp/.s.PGSQL.5432')
+      ? '/tmp'
+      : undefined;
+
+  const host = process.env.POSTGRES_HOST || defaultSocketDir;
+  const database = process.env.POSTGRES_DB || 'bufferflow_db';
+  const username = process.env.POSTGRES_USER || 'bufferflow_user';
   const password = process.env.POSTGRES_PASSWORD;
   const port = Number(process.env.POSTGRES_PORT || 5432);
 
   // If not in prod and no socket/url/host configured, stay in dev in-memory mode
   if (!customUrl && !host && !isProd) {
     console.log(
-      `[Bufferflow DB] Running in local development mode (no PostgreSQL socket at ${defaultSocketDir}). Historical results stored in memory.`
+      '[Bufferflow DB] Running in local development mode (no PostgreSQL socket found). Historical results stored in memory.'
     );
     return false;
   }
@@ -72,54 +76,41 @@ export async function initDb(): Promise<boolean> {
     // Ping check
     await client`SELECT 1`;
 
-    // Ensure isolated schema and table exist
-    await client.unsafe(`CREATE SCHEMA IF NOT EXISTS "${schemaName}";`);
-    await client.unsafe(`
-      CREATE TABLE IF NOT EXISTS "${schemaName}"."test_runs" (
-        "id" text PRIMARY KEY,
-        "run_id" text NOT NULL,
-        "session_id" text NOT NULL,
-        "test_type" text NOT NULL,
-        "is_multi_level" boolean DEFAULT false,
-        "completed_reason" text NOT NULL,
-        "duration_sec" integer NOT NULL,
-        "started_at" timestamp with time zone NOT NULL,
-        "completed_at" timestamp with time zone NOT NULL,
-        "target_rps" integer NOT NULL,
-        "worker_count" integer NOT NULL,
-        "peak_incoming_rps" integer DEFAULT 0,
-        "peak_accepted_rps" integer DEFAULT 0,
-        "peak_drained_rps" integer DEFAULT 0,
-        "p50_latency_ms" integer DEFAULT 0,
-        "p95_latency_ms" integer DEFAULT 0,
-        "p99_latency_ms" integer DEFAULT 0,
-        "total_ingressed" integer DEFAULT 0,
-        "total_accepted" integer DEFAULT 0,
-        "total_processed" integer DEFAULT 0,
-        "total_failed" integer DEFAULT 0,
-        "summary" jsonb NOT NULL,
-        "config" jsonb NOT NULL,
-        "strategy_breakdown" jsonb,
-        "level_breakdowns" jsonb,
-        "workers" jsonb,
-        "created_at" timestamp with time zone DEFAULT now() NOT NULL
-      );
-    `);
-    await client.unsafe(`
-      CREATE INDEX IF NOT EXISTS "idx_${schemaName}_test_runs_created" 
-      ON "${schemaName}"."test_runs" ("created_at" DESC);
-    `);
-    await client.unsafe(`
-      CREATE INDEX IF NOT EXISTS "idx_${schemaName}_test_runs_session" 
-      ON "${schemaName}"."test_runs" ("session_id");
-    `);
-
     sqlClient = client;
     dbInstance = drizzle(client, { schema });
+
+    // Migration handling:
+    // In production, always ensure pending migrations are applied automatically on boot.
+    // In development (which frequently restarts via watcher), only run migration if initial
+    // bootstrap is needed (tables don't exist yet) or explicitly requested via RUN_MIGRATIONS=true.
+    const migrationsFolder = join(process.cwd(), 'drizzle');
+    if (existsSync(migrationsFolder)) {
+      const forceMigrate = isProd || process.env.RUN_MIGRATIONS === 'true';
+      let shouldMigrate = forceMigrate;
+
+      if (!shouldMigrate) {
+        const [check] = await client`SELECT to_regclass('public.test_runs') AS tbl`;
+        if (!check?.tbl) {
+          shouldMigrate = true;
+        }
+      }
+
+      if (shouldMigrate) {
+        try {
+          await migrate(dbInstance, { migrationsFolder });
+          console.log('[Bufferflow DB] Database migrations applied successfully.');
+        } catch (migrationErr: any) {
+          console.warn(
+            `[Bufferflow DB] Migration notice: ${migrationErr?.message || migrationErr}`
+          );
+        }
+      }
+    }
+
     isConnectedToPostgres = true;
 
     console.log(
-      `[Bufferflow DB] Connected to PostgreSQL (${host ? `socket/host: ${host}` : 'url'}), using isolated schema "${schemaName}".`
+      `[Bufferflow DB] Connected to PostgreSQL (${host ? `socket/host: ${host}` : 'url'}), database "${database}" as "${username}".`
     );
     return true;
   } catch (err: any) {

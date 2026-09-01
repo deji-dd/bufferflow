@@ -29,6 +29,7 @@ COPY --from=builder /app/dist ./dist
 COPY package.json ./
 COPY tsconfig.json ./
 COPY src ./src
+COPY drizzle ./drizzle
 
 EXPOSE 3001
 
