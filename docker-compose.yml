@@ -1,5 +1,6 @@
 services:
   bufferflow:
+    image: ghcr.io/deji-dd/bufferflow:${BUFFERFLOW_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile
