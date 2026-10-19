@@ -10,6 +10,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import { apiFetch } from '@/lib/api';
 import type { DLQItem } from '../../../src/core/types';
 
 interface DlqModalProps {
@@ -38,7 +39,7 @@ export const DlqModal: React.FC<DlqModalProps> = ({
   const fetchDlqItems = async () => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/dlq?session=${sessionId}`);
+      const res = await apiFetch(`/api/dlq?session=${sessionId}`);
       const data = await res.json();
       if (data && !data.error) {
         setItems(data.items || []);

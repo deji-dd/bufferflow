@@ -5,4 +5,6 @@ node_modules/
 *.log
 .DS_Store
 dist/
-scripts/sync-env.sh
+*.tsbuildinfo
+.bun-tmp/
+.bun-cache/

@@ -1,15 +1,31 @@
 import type React from 'react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import type { BurstProgress, SuiteProgress, TelemetryFrame } from '../../src/core/types';
 import { ControlMatrix, type TrafficConfig } from './components/ControlMatrix';
-import { DagPipeline } from './components/DagPipeline';
-import { DlqModal } from './components/DlqModal';
 import { Footer } from './components/Footer';
 import { Header } from './components/Header';
-import { HistoryModal } from './components/HistoryModal';
 import { KpiGrid } from './components/KpiGrid';
-import { ResultsModal, type TestRunResults } from './components/ResultsModal';
-import { type ChartDataPoint, ThroughputChart } from './components/ThroughputChart';
+import type { TestRunResults } from './components/ResultsModal';
+import type { ChartDataPoint } from './components/ThroughputChart';
+import { apiFetch, clearStoredToken, getStoredToken, storeToken, withAuthQuery } from './lib/api';
+
+// Heavy panels are split into their own chunks. They are always rendered, but
+// charts + the React Flow/Dagre bundle no longer inflate the initial JS chunk.
+const DagPipeline = lazy(() =>
+  import('./components/DagPipeline').then((module) => ({ default: module.DagPipeline }))
+);
+const ThroughputChart = lazy(() =>
+  import('./components/ThroughputChart').then((module) => ({ default: module.ThroughputChart }))
+);
+const DlqModal = lazy(() =>
+  import('./components/DlqModal').then((module) => ({ default: module.DlqModal }))
+);
+const HistoryModal = lazy(() =>
+  import('./components/HistoryModal').then((module) => ({ default: module.HistoryModal }))
+);
+const ResultsModal = lazy(() =>
+  import('./components/ResultsModal').then((module) => ({ default: module.ResultsModal }))
+);
 
 const SESSION_ID = (() => {
   if (typeof window === 'undefined') return 'default';
@@ -65,6 +81,13 @@ export const App: React.FC = () => {
   const [historyModalOpen, setHistoryModalOpen] = useState<boolean>(false);
   const [historyCount, setHistoryCount] = useState<number>(0);
   const [latestResults, setLatestResults] = useState<TestRunResults | null>(null);
+  const [maxConcurrencyPerWorker, setMaxConcurrencyPerWorker] = useState<number>(25);
+
+  // Optional bearer-token gate. The server exposes /api/auth/status publicly so
+  // the dashboard can discover whether BUFFERFLOW_API_TOKEN is configured.
+  const [authState, setAuthState] = useState<'loading' | 'required' | 'ready'>('loading');
+  const [authError, setAuthError] = useState<string>('');
+  const [tokenInput, setTokenInput] = useState<string>('');
 
   const [trafficConfig, setTrafficConfig] = useState<TrafficConfig>({
     targetRps: 2000,
@@ -80,9 +103,16 @@ export const App: React.FC = () => {
   const [chartData, setChartData] = useState<ChartDataPoint[]>(createEmptyChartData);
 
   const previousWorkerStates = useRef<Map<string, string>>(new Map());
-  const trafficActiveRef = useRef<boolean>(false);
-  const isSuiteRunActiveRef = useRef<boolean>(false);
-  const lastSuiteResultsRef = useRef<any>(null);
+  // True from start until the server reports both traffic and suite idle.
+  const runActiveRef = useRef<boolean>(false);
+  // Set only after an active frame is observed, to avoid an in-flight idle
+  // frame completing a run immediately after pressing Start.
+  const sawActiveFrameRef = useRef<boolean>(false);
+  // Set after an explicit stop so late "still draining" frames cannot re-open
+  // the results modal.
+  const suppressAutoCompleteRef = useRef<boolean>(false);
+  // True when the active run is a server-managed suite.
+  const suiteWasActiveRef = useRef<boolean>(false);
   const trafficConfigRef = useRef<TrafficConfig>(trafficConfig);
   const metricsRef = useRef<TelemetryFrame['metrics']>(metrics);
   const workersRef = useRef<TelemetryFrame['workers']>(workers);
@@ -92,7 +122,7 @@ export const App: React.FC = () => {
   const peakDrainedRpsRef = useRef<number>(0);
 
   const refreshHistoryCount = useCallback(() => {
-    fetch('/api/history?limit=1')
+    apiFetch('/api/history?limit=1')
       .then((r) => r.json())
       .then((data) => {
         if (data && typeof data.total === 'number') {
@@ -102,9 +132,75 @@ export const App: React.FC = () => {
       .catch(() => {});
   }, []);
 
+  // Seed the controls with the server's effective config, and re-sync after a
+  // suite finishes so restored (pre-suite) values are shown again.
+  const syncConfigFromServer = useCallback(async () => {
+    try {
+      const [statusRes, configRes] = await Promise.all([
+        apiFetch(`/api/traffic/status?session=${SESSION_ID}`, {
+          headers: { 'X-Session-Id': SESSION_ID },
+        }),
+        apiFetch(`/api/config?session=${SESSION_ID}`, {
+          headers: { 'X-Session-Id': SESSION_ID },
+        }),
+      ]);
+      const status = await statusRes.json();
+      const cfg = await configRes.json();
+      if (!cfg || cfg.error) return;
+
+      const trafficCfg = status && !status.error && status.config ? status.config : {};
+      setTrafficConfig((prev) => ({
+        ...prev,
+        targetRps: Number.isFinite(trafficCfg.targetRps) ? trafficCfg.targetRps : prev.targetRps,
+        durationSec: Number.isFinite(trafficCfg.durationSec)
+          ? trafficCfg.durationSec
+          : prev.durationSec,
+        isUnlimited: Boolean(trafficCfg.isUnlimited),
+        idempotencyCollisionRate: Number.isFinite(trafficCfg.idempotencyCollisionRate)
+          ? trafficCfg.idempotencyCollisionRate
+          : prev.idempotencyCollisionRate,
+        failureRate: Number.isFinite(cfg.mockDownstreamFailureRate)
+          ? cfg.mockDownstreamFailureRate
+          : prev.failureRate,
+        downstreamLatencyMs: Number.isFinite(cfg.mockDownstreamLatencyMs)
+          ? cfg.mockDownstreamLatencyMs
+          : prev.downstreamLatencyMs,
+        workerCount: Number.isFinite(cfg.workerCount) ? cfg.workerCount : prev.workerCount,
+        routingStrategy:
+          typeof cfg.routingStrategy === 'string' ? cfg.routingStrategy : prev.routingStrategy,
+      }));
+      if (Number.isFinite(cfg.maxConcurrencyPerWorker)) {
+        setMaxConcurrencyPerWorker(cfg.maxConcurrencyPerWorker);
+      }
+    } catch {
+      // Ignore transient fetch errors
+    }
+  }, []);
+
+  // Poll for the compiled suite result. The server finishes its final drain
+  // after traffic stops, so completion is not instantaneous.
+  const fetchSuiteResults = useCallback(async (maxAttempts: number = 12): Promise<any | null> => {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const res = await apiFetch(`/api/traffic/status?session=${SESSION_ID}`, {
+          headers: { 'X-Session-Id': SESSION_ID },
+        });
+        const data = await res.json();
+        if (data && !data.error) {
+          if (data.suiteResults) return data.suiteResults;
+          if (!data.isServerRunningTest && !data.active && attempt >= 2) return null;
+        }
+      } catch {
+        // Retry
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    return null;
+  }, []);
+
   const handleSelectHistoricalRun = useCallback(async (runId: string) => {
     try {
-      const res = await fetch(`/api/history/${encodeURIComponent(runId)}`);
+      const res = await apiFetch(`/api/history/${encodeURIComponent(runId)}`);
       const data = await res.json();
       if (data && !data.error) {
         setLatestResults(data);
@@ -117,17 +213,87 @@ export const App: React.FC = () => {
   }, []);
 
   // Keep refs in sync for event listeners
-  trafficActiveRef.current = trafficActive;
   trafficConfigRef.current = trafficConfig;
   metricsRef.current = metrics;
   workersRef.current = workers;
 
-  // Initialize theme and load any prior suite results on mount
+  // Discover whether this deployment requires a token, and validate a stored one.
+  useEffect(() => {
+    let cancelled = false;
+    const checkAuth = async () => {
+      try {
+        const res = await fetch('/api/auth/status');
+        const data = await res.json();
+        if (!data?.required) {
+          if (!cancelled) setAuthState('ready');
+          return;
+        }
+
+        const token = getStoredToken();
+        if (!token) {
+          if (!cancelled) setAuthState('required');
+          return;
+        }
+
+        const verify = await apiFetch('/api/config', {
+          headers: { 'X-Session-Id': SESSION_ID },
+        });
+        if (verify.status === 401) {
+          clearStoredToken();
+          if (!cancelled) {
+            setAuthError('The stored API token is invalid.');
+            setAuthState('required');
+          }
+          return;
+        }
+        if (!cancelled) setAuthState('ready');
+      } catch {
+        // If the status endpoint is unreachable, let normal requests surface
+        // the error rather than trapping the user on the gate forever.
+        if (!cancelled) setAuthState('ready');
+      }
+    };
+
+    void checkAuth();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleTokenSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const token = tokenInput.trim();
+    if (!token) {
+      setAuthError('Enter an API token.');
+      return;
+    }
+
+    storeToken(token);
+    try {
+      const res = await apiFetch('/api/config', {
+        headers: { 'X-Session-Id': SESSION_ID },
+      });
+      if (res.status === 401) {
+        clearStoredToken();
+        setAuthError('Invalid API token.');
+        return;
+      }
+      window.location.reload();
+    } catch {
+      clearStoredToken();
+      setAuthError('Could not verify the token. Check the server and try again.');
+    }
+  };
+
+  // Initialize theme, load any prior suite results, and seed live config
   useEffect(() => {
     const isLight = document.documentElement.classList.contains('light');
     setTheme(isLight ? 'light' : 'dark');
 
-    fetch(`/api/traffic/suite-results?session=${SESSION_ID}`, {
+    // Do not fire protected requests until the token gate has resolved.
+    if (authState !== 'ready') return;
+
+    apiFetch(`/api/traffic/suite-results?session=${SESSION_ID}`, {
       headers: { 'X-Session-Id': SESSION_ID },
     })
       .then((r) => r.json())
@@ -139,7 +305,8 @@ export const App: React.FC = () => {
       .catch(() => {});
 
     refreshHistoryCount();
-  }, [refreshHistoryCount]);
+    void syncConfigFromServer();
+  }, [authState, refreshHistoryCount, syncConfigFromServer]);
 
   const handleToggleTheme = () => {
     const isCurrentlyLight = document.documentElement.classList.toggle('light');
@@ -166,6 +333,7 @@ export const App: React.FC = () => {
       return {
         runId: `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
         sessionId: SESSION_ID,
+        testType: 'STANDARD',
         startedAt: new Date(start).toISOString(),
         completedAt: new Date(now).toISOString(),
         durationSec,
@@ -193,19 +361,27 @@ export const App: React.FC = () => {
 
   const handleStopTraffic = useCallback(
     async (reason: TestRunResults['completedReason'] = 'stopped_by_user') => {
-      if (!trafficActiveRef.current) return;
-      const wasSuite = isSuiteRunActiveRef.current || !!lastSuiteResultsRef.current;
-      trafficActiveRef.current = false;
-      isSuiteRunActiveRef.current = false;
+      if (!runActiveRef.current) return;
+      const wasSuite = suiteWasActiveRef.current;
+      const stopReason = reason === 'completed' ? ('stopped_by_user' as const) : reason;
+
+      runActiveRef.current = false;
+      sawActiveFrameRef.current = false;
+      suppressAutoCompleteRef.current = true;
+      suiteWasActiveRef.current = false;
       setTrafficActive(false);
       setIsServerRunningTest(false);
       setBurstProgress(undefined);
       setSuiteProgress(undefined);
 
       try {
-        const res = await fetch('/api/traffic/stop', {
+        const res = await apiFetch('/api/traffic/stop', {
           method: 'POST',
-          headers: { 'X-Session-Id': SESSION_ID },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Session-Id': SESSION_ID,
+          },
+          body: JSON.stringify({ reason: stopReason }),
         });
         const data = await res.json();
         addLog(
@@ -214,11 +390,14 @@ export const App: React.FC = () => {
         );
 
         if (wasSuite) {
-          const suiteRes = data.suiteResults || lastSuiteResultsRef.current;
+          // The stop response normally contains the compiled suite result. If
+          // the server was mid-finalize, poll the status endpoint briefly.
+          const suiteRes = data.suiteResults ?? (await fetchSuiteResults());
           if (suiteRes && (suiteRes.testType === 'FULL_SUITE' || suiteRes.strategyBreakdown)) {
             suiteRes.completedReason = reason;
             setLatestResults(suiteRes);
             setResultsModalOpen(true);
+            await syncConfigFromServer();
             return;
           }
         }
@@ -226,38 +405,37 @@ export const App: React.FC = () => {
         addLog(`Stop request completed: ${err.message}`, 'text-[#f59e0b]');
       }
 
-      if (wasSuite && lastSuiteResultsRef.current) {
-        lastSuiteResultsRef.current.completedReason = reason;
-        setLatestResults(lastSuiteResultsRef.current);
-        setResultsModalOpen(true);
-        return;
-      }
-
-      // Generate results and open export modal
+      // Manual run (or a suite whose results could not be loaded): build the
+      // local execution summary from the latest telemetry frame.
       const results = buildRunResults(reason);
       setLatestResults(results);
       setResultsModalOpen(true);
-      fetch('/api/history', {
+      apiFetch('/api/history', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(results),
       })
         .then(() => refreshHistoryCount())
         .catch(() => {});
+      await syncConfigFromServer();
     },
-    [addLog, buildRunResults, refreshHistoryCount]
+    [addLog, buildRunResults, fetchSuiteResults, refreshHistoryCount, syncConfigFromServer]
   );
 
   // WebSocket Connection per Session
   useEffect(() => {
+    if (authState !== 'ready') return;
+
     let ws: WebSocket | null = null;
     let reconnectTimeout: ReturnType<typeof setTimeout>;
+    let disposed = false;
 
     const connect = () => {
+      if (disposed) return;
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const isDev = window.location.port === '5173';
       const wsHost = isDev ? `${window.location.hostname}:3001` : window.location.host;
-      const wsUrl = `${proto}//${wsHost}/ws?session=${SESSION_ID}`;
+      const wsUrl = withAuthQuery(`${proto}//${wsHost}/ws?session=${SESSION_ID}`);
 
       ws = new WebSocket(wsUrl);
 
@@ -288,96 +466,79 @@ export const App: React.FC = () => {
             );
           }
 
+          if (typeof frame.maxConcurrencyPerWorker === 'number') {
+            setMaxConcurrencyPerWorker(frame.maxConcurrencyPerWorker);
+          }
           if (frame.suiteProgress) {
             setSuiteProgress(frame.suiteProgress);
           }
           if (typeof frame.isServerRunningTest === 'boolean') {
             setIsServerRunningTest(frame.isServerRunningTest);
             if (frame.isServerRunningTest) {
-              isSuiteRunActiveRef.current = true;
+              suiteWasActiveRef.current = true;
             }
           }
-          if (frame.suiteResults) {
-            lastSuiteResultsRef.current = frame.suiteResults;
+          if (frame.trafficActive || frame.isServerRunningTest) {
+            if (!suppressAutoCompleteRef.current) {
+              runActiveRef.current = true;
+              sawActiveFrameRef.current = true;
+            }
           }
 
-          // Check for auto-completion (trafficActive was true, now false)
-          if (trafficActiveRef.current && !frame.trafficActive) {
-            const wasSuite =
-              isSuiteRunActiveRef.current || !!frame.suiteResults || !!lastSuiteResultsRef.current;
-            trafficActiveRef.current = false;
+          // A run is only finished once traffic AND the suite (if any) are
+          // idle. During a suite's final drain traffic is already false while
+          // the suite is still finalizing, so waiting here avoids fetching
+          // results too early or showing stale ones.
+          const justFinished =
+            !suppressAutoCompleteRef.current &&
+            runActiveRef.current &&
+            sawActiveFrameRef.current &&
+            !frame.trafficActive &&
+            !frame.isServerRunningTest;
+
+          if (justFinished) {
+            const wasSuite = suiteWasActiveRef.current;
+            runActiveRef.current = false;
+            sawActiveFrameRef.current = false;
+            suiteWasActiveRef.current = false;
             setTrafficActive(false);
+            setIsServerRunningTest(false);
             setBurstProgress(undefined);
             setSuiteProgress(undefined);
 
             if (wasSuite) {
-              const fetchSuiteResults = async (retries = 6) => {
-                const suiteRes = frame.suiteResults || lastSuiteResultsRef.current;
+              void fetchSuiteResults().then(async (suiteRes) => {
                 if (
                   suiteRes &&
                   (suiteRes.testType === 'FULL_SUITE' || suiteRes.strategyBreakdown)
                 ) {
-                  isSuiteRunActiveRef.current = false;
-                  setIsServerRunningTest(false);
                   setLatestResults(suiteRes);
                   setResultsModalOpen(true);
                   addLog(
                     'Full suite stress test completed and benchmark compiled.',
                     'text-[#10b981]'
                   );
-                  return;
-                }
-
-                try {
-                  const r = await fetch(`/api/traffic/suite-results?session=${SESSION_ID}`, {
-                    headers: { 'X-Session-Id': SESSION_ID },
-                  });
-                  const res = await r.json();
-                  if (
-                    res &&
-                    !res.error &&
-                    (res.testType === 'FULL_SUITE' || res.strategyBreakdown)
-                  ) {
-                    isSuiteRunActiveRef.current = false;
-                    setIsServerRunningTest(false);
-                    setLatestResults(res);
-                    setResultsModalOpen(true);
-                    addLog(
-                      'Full suite stress test completed and benchmark compiled.',
-                      'text-[#10b981]'
-                    );
-                    return;
-                  }
-                } catch {
-                  // Retry
-                }
-
-                if (retries > 0) {
-                  setTimeout(() => fetchSuiteResults(retries - 1), 500);
                 } else {
-                  isSuiteRunActiveRef.current = false;
-                  setIsServerRunningTest(false);
+                  addLog('Suite completed, but results are not available yet.', 'text-[#f59e0b]');
                 }
-              };
-
-              fetchSuiteResults();
+                await syncConfigFromServer();
+              });
             } else {
-              setIsServerRunningTest(false);
               addLog('Traffic run completed.', 'text-[#10b981]');
               const results = buildRunResults('completed', frame.metrics, frame.workers);
               setLatestResults(results);
               setResultsModalOpen(true);
-              fetch('/api/history', {
+              apiFetch('/api/history', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(results),
               })
                 .then(() => refreshHistoryCount())
                 .catch(() => {});
+              void syncConfigFromServer();
             }
           } else {
             setTrafficActive(frame.trafficActive);
-            trafficActiveRef.current = frame.trafficActive;
           }
 
           if (frame.burstProgress) {
@@ -430,6 +591,8 @@ export const App: React.FC = () => {
       };
 
       ws.onclose = () => {
+        if (disposed) return;
+        clearTimeout(reconnectTimeout);
         reconnectTimeout = setTimeout(connect, 2000);
       };
 
@@ -441,15 +604,23 @@ export const App: React.FC = () => {
     connect();
 
     return () => {
+      disposed = true;
       clearTimeout(reconnectTimeout);
       ws?.close();
     };
-  }, [addLog, buildRunResults]);
+  }, [
+    addLog,
+    authState,
+    buildRunResults,
+    fetchSuiteResults,
+    refreshHistoryCount,
+    syncConfigFromServer,
+  ]);
 
   // Safety Fallbacks: Tab Visibility, Window Blur, and Page Unload
   useEffect(() => {
     const handleVisibilityChange = () => {
-      if (document.hidden && trafficActiveRef.current) {
+      if (document.hidden && runActiveRef.current) {
         addLog(
           'Safety fallback triggered: window/tab lost visibility. Stopping traffic.',
           'text-[#f43f5e]'
@@ -459,15 +630,18 @@ export const App: React.FC = () => {
     };
 
     const handleBlur = () => {
-      if (trafficActiveRef.current) {
+      if (runActiveRef.current) {
         addLog('Safety fallback triggered: window lost focus. Stopping traffic.', 'text-[#f43f5e]');
         handleStopTraffic('safety_fallback_blur');
       }
     };
 
     const handleBeforeUnload = () => {
-      if (trafficActiveRef.current) {
-        navigator.sendBeacon(`/api/traffic/stop?session=${SESSION_ID}`);
+      if (runActiveRef.current) {
+        const body = new Blob([JSON.stringify({ reason: 'safety_fallback_unload' })], {
+          type: 'application/json',
+        });
+        navigator.sendBeacon(withAuthQuery(`/api/traffic/stop?session=${SESSION_ID}`), body);
       }
     };
 
@@ -489,7 +663,7 @@ export const App: React.FC = () => {
     trafficConfigRef.current = nextConfig;
 
     // Controls affect ops live: Push full runtime configuration to server immediately
-    fetch('/api/config', {
+    apiFetch('/api/config', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -521,8 +695,10 @@ export const App: React.FC = () => {
     peakDrainedRpsRef.current = 0;
     runStartTimeRef.current = Date.now();
 
-    trafficActiveRef.current = true;
-    isSuiteRunActiveRef.current = false;
+    runActiveRef.current = true;
+    sawActiveFrameRef.current = false;
+    suppressAutoCompleteRef.current = false;
+    suiteWasActiveRef.current = false;
     setTrafficActive(true);
     setBurstProgress({
       active: true,
@@ -540,7 +716,7 @@ export const App: React.FC = () => {
     );
 
     try {
-      const res = await fetch('/api/traffic/start', {
+      const res = await apiFetch('/api/traffic/start', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -549,10 +725,15 @@ export const App: React.FC = () => {
         body: JSON.stringify(trafficConfig),
       });
       const data = await res.json();
+      if (!res.ok || data.success === false) {
+        throw new Error(data.message || data.error || 'Server rejected the traffic start request.');
+      }
       addLog(data.message || 'Traffic burst successfully initiated.', 'text-[#10b981]');
     } catch (err: any) {
-      trafficActiveRef.current = false;
-      isSuiteRunActiveRef.current = false;
+      runActiveRef.current = false;
+      sawActiveFrameRef.current = false;
+      suppressAutoCompleteRef.current = false;
+      suiteWasActiveRef.current = false;
       setTrafficActive(false);
       setBurstProgress(undefined);
       addLog(`Failed to start traffic: ${err.message}`, 'text-[#f43f5e]');
@@ -571,20 +752,21 @@ export const App: React.FC = () => {
     peakAcceptedRpsRef.current = 0;
     peakDrainedRpsRef.current = 0;
     runStartTimeRef.current = Date.now();
-    lastSuiteResultsRef.current = null;
 
-    isSuiteRunActiveRef.current = true;
+    suiteWasActiveRef.current = true;
+    runActiveRef.current = true;
+    sawActiveFrameRef.current = false;
+    suppressAutoCompleteRef.current = false;
     setIsServerRunningTest(true);
-    trafficActiveRef.current = true;
     setTrafficActive(true);
 
     addLog(
-      'Initiating Fully Automated Benchmark Matrix: all 4 levels × 7 strategies (28 benchmarks total), buffer purged between steps...',
+      'Initiating Fully Automated Benchmark Matrix: all 4 levels × 7 strategies (28 benchmarks total), traffic drained between steps...',
       'text-[#a855f7]'
     );
 
     try {
-      const res = await fetch('/api/traffic/full-test', {
+      const res = await apiFetch('/api/traffic/full-test', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -596,11 +778,16 @@ export const App: React.FC = () => {
         }),
       });
       const data = await res.json();
+      if (!res.ok || data.success === false) {
+        throw new Error(data.message || data.error || 'Server rejected the suite start request.');
+      }
       addLog(data.message || 'Server full suite stress test started.', 'text-[#a855f7]');
     } catch (err: any) {
-      isSuiteRunActiveRef.current = false;
+      suiteWasActiveRef.current = false;
+      runActiveRef.current = false;
+      sawActiveFrameRef.current = false;
+      suppressAutoCompleteRef.current = false;
       setIsServerRunningTest(false);
-      trafficActiveRef.current = false;
       setTrafficActive(false);
       addLog(`Failed to start server suite test: ${err.message}`, 'text-[#f43f5e]');
     }
@@ -639,7 +826,7 @@ export const App: React.FC = () => {
     setTrafficConfig(randomized);
     trafficConfigRef.current = randomized;
 
-    fetch('/api/config', {
+    apiFetch('/api/config', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -665,7 +852,7 @@ export const App: React.FC = () => {
 
   const handleReplaySingle = async (id: string) => {
     try {
-      const res = await fetch('/api/dlq/replay', {
+      const res = await apiFetch('/api/dlq/replay', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -684,7 +871,7 @@ export const App: React.FC = () => {
 
   const handleReplayAll = async () => {
     try {
-      const res = await fetch('/api/dlq/replay', {
+      const res = await apiFetch('/api/dlq/replay', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -704,7 +891,7 @@ export const App: React.FC = () => {
 
   const handlePurgeDlq = async () => {
     try {
-      const res = await fetch('/api/dlq', {
+      const res = await apiFetch('/api/dlq', {
         method: 'DELETE',
         headers: { 'X-Session-Id': SESSION_ID },
       });
@@ -714,6 +901,61 @@ export const App: React.FC = () => {
       addLog(`Failed to purge DLQ: ${err.message}`, 'text-[#f43f5e]');
     }
   };
+
+  if (authState === 'loading') {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#07090e] text-[#94a3b8] font-mono text-sm">
+        Checking authorization…
+      </div>
+    );
+  }
+
+  if (authState === 'required') {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#07090e] p-6">
+        <form
+          onSubmit={handleTokenSubmit}
+          className="glass-card rounded-2xl p-8 w-full max-w-md flex flex-col gap-4"
+        >
+          <div>
+            <h1 className="text-lg font-bold tracking-wider text-white">BUFFERFLOW</h1>
+            <p className="text-xs text-[#94a3b8] mt-1">
+              This deployment requires an API token to access the control plane.
+            </p>
+          </div>
+
+          <label
+            htmlFor="bufferflow-api-token"
+            className="text-[10px] font-mono uppercase tracking-wider text-[#64748b]"
+          >
+            API token
+          </label>
+          <input
+            id="bufferflow-api-token"
+            type="password"
+            autoComplete="current-password"
+            value={tokenInput}
+            onChange={(event) => setTokenInput(event.target.value)}
+            placeholder="Bearer token"
+            className="w-full bg-[#0a0e16] border border-white/10 rounded-lg px-3 py-2 text-sm text-white font-mono outline-none focus:border-[#00f0ff]"
+          />
+
+          {authError && <p className="text-xs text-[#f43f5e] font-mono">{authError}</p>}
+
+          <button
+            type="submit"
+            className="cursor-pointer rounded-lg border border-[#00f0ff]/40 bg-[#00f0ff]/15 px-4 py-2 text-xs font-mono font-bold text-[#00f0ff] transition hover:bg-[#00f0ff]/25"
+          >
+            UNLOCK DASHBOARD
+          </button>
+
+          <p className="text-[10px] font-mono text-[#64748b]">
+            The token is kept in this browser&apos;s localStorage.
+          </p>
+        </form>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -747,12 +989,21 @@ export const App: React.FC = () => {
           onOpenDlq={() => setDlqModalOpen(true)}
         />
 
-        <DagPipeline
-          metrics={metrics}
-          workers={workers}
-          trafficActive={trafficActive}
-          routingStrategy={routingStrategy}
-        />
+        <Suspense
+          fallback={
+            <div className="glass-card rounded-2xl p-6 h-[420px] flex items-center justify-center text-xs font-mono text-[#64748b]">
+              Loading architecture canvas…
+            </div>
+          }
+        >
+          <DagPipeline
+            metrics={metrics}
+            workers={workers}
+            trafficActive={trafficActive}
+            routingStrategy={routingStrategy}
+            maxConcurrencyPerWorker={maxConcurrencyPerWorker}
+          />
+        </Suspense>
 
         <ControlMatrix
           config={trafficConfig}
@@ -767,40 +1018,60 @@ export const App: React.FC = () => {
           onRandomize={handleRandomize}
         />
 
-        <ThroughputChart
-          data={chartData}
-          targetRps={trafficConfig.targetRps}
-          durationSec={trafficConfig.durationSec}
-          downstreamLatencyMs={trafficConfig.downstreamLatencyMs}
-          bufferCapacity={metrics.bufferCapacity}
-        />
+        <Suspense
+          fallback={
+            <div className="glass-card rounded-2xl p-6 h-[220px] flex items-center justify-center text-xs font-mono text-[#64748b]">
+              Loading charts…
+            </div>
+          }
+        >
+          <ThroughputChart
+            data={chartData}
+            targetRps={trafficConfig.targetRps}
+            durationSec={trafficConfig.durationSec}
+            downstreamLatencyMs={trafficConfig.downstreamLatencyMs}
+            bufferCapacity={metrics.bufferCapacity}
+          />
+        </Suspense>
 
         <Footer />
       </div>
 
-      <DlqModal
-        isOpen={dlqModalOpen}
-        sessionId={SESSION_ID}
-        onClose={() => setDlqModalOpen(false)}
-        onReplaySingle={handleReplaySingle}
-        onReplayAll={handleReplayAll}
-        onPurge={handlePurgeDlq}
-      />
+      {dlqModalOpen && (
+        <Suspense fallback={null}>
+          <DlqModal
+            isOpen={dlqModalOpen}
+            sessionId={SESSION_ID}
+            onClose={() => setDlqModalOpen(false)}
+            onReplaySingle={handleReplaySingle}
+            onReplayAll={handleReplayAll}
+            onPurge={handlePurgeDlq}
+          />
+        </Suspense>
+      )}
 
-      <ResultsModal
-        isOpen={resultsModalOpen}
-        results={latestResults}
-        onClose={() => setResultsModalOpen(false)}
-      />
+      {resultsModalOpen && (
+        <Suspense fallback={null}>
+          <ResultsModal
+            isOpen={resultsModalOpen}
+            results={latestResults}
+            onClose={() => setResultsModalOpen(false)}
+          />
+        </Suspense>
+      )}
 
-      <HistoryModal
-        isOpen={historyModalOpen}
-        onClose={() => {
-          setHistoryModalOpen(false);
-          refreshHistoryCount();
-        }}
-        onSelectRun={handleSelectHistoricalRun}
-      />
+      {historyModalOpen && (
+        <Suspense fallback={null}>
+          <HistoryModal
+            isOpen={historyModalOpen}
+            onClose={() => {
+              setHistoryModalOpen(false);
+              refreshHistoryCount();
+            }}
+            onSelectRun={handleSelectHistoricalRun}
+          />
+        </Suspense>
+      )}
     </>
   );
 };

@@ -52,8 +52,9 @@ export class WorkerPool {
   }
 
   public initWorkers(count: number): void {
+    const safeCount = Math.max(1, Math.floor(Number.isFinite(count) ? count : 1));
     const newWorkers: WorkerInfo[] = [];
-    for (let i = 0; i < count; i++) {
+    for (let i = 0; i < safeCount; i++) {
       const existing = this.workers[i];
       if (existing) {
         newWorkers.push(existing);
@@ -78,8 +79,11 @@ export class WorkerPool {
   }
 
   public updateConfig(config: Partial<WorkerPoolOptions>): void {
-    if (config.workerCount !== undefined && config.workerCount !== this.workers.length) {
-      this.initWorkers(config.workerCount);
+    if (config.workerCount !== undefined) {
+      const nextCount = Math.max(1, Math.floor(config.workerCount));
+      if (nextCount !== this.workers.length) {
+        this.initWorkers(nextCount);
+      }
     }
     if (config.routingStrategy !== undefined) {
       this.routingStrategy = config.routingStrategy;
@@ -396,6 +400,8 @@ export class WorkerPool {
 
     try {
       if (isFailure) {
+        // Retryable attempts are intentionally not reported to the metrics
+        // collector; only terminal outcomes (success or DLQ) are.
         this.handleFailure(
           worker,
           item,
@@ -403,7 +409,6 @@ export class WorkerPool {
           dlq,
           'Downstream 500 Internal Server Error (Simulated Outage)'
         );
-        if (this.onEventProcessed) this.onEventProcessed(item, false, worker.id);
       } else {
         this.handleSuccess(worker, item);
         if (this.onEventProcessed) this.onEventProcessed(item, true, worker.id);
@@ -429,6 +434,22 @@ export class WorkerPool {
     }
   }
 
+  /**
+   * Records a terminal failure (the item will not be retried again) and routes it
+   * to the DLQ. This is the single place where failed-work accounting happens.
+   */
+  private finalizeFailure(
+    worker: WorkerInfo,
+    item: IngressPayload,
+    dlq: DeadLetterQueue,
+    reason: string
+  ): void {
+    worker.totalFailed++;
+    const attemptLabel = item.attempts === 1 ? 'attempt' : 'attempts';
+    dlq.push(item, `${reason} (Exhausted ${item.attempts} ${attemptLabel})`);
+    if (this.onEventProcessed) this.onEventProcessed(item, false, worker.id);
+  }
+
   private handleFailure(
     worker: WorkerInfo,
     item: IngressPayload,
@@ -436,11 +457,10 @@ export class WorkerPool {
     dlq: DeadLetterQueue,
     reason: string
   ): void {
-    worker.totalFailed++;
     worker.consecutiveFailures++;
     worker.consecutiveSuccesses = 0;
 
-    // Circuit Breaker check
+    // Circuit Breaker check (counts every attempt, including retries)
     if (
       worker.circuitState === 'HALF_OPEN' ||
       worker.consecutiveFailures >= this.circuitFailureThreshold
@@ -450,18 +470,48 @@ export class WorkerPool {
       worker.circuitTrippedAt = Date.now();
     }
 
-    // Retry handling
+    // Retry handling. `maxAttempts` is the total attempt budget.
     item.attempts++;
-    if (item.attempts < this.maxRetries) {
+    const maxAttempts =
+      Number.isFinite(item.maxAttempts) && item.maxAttempts > 0
+        ? Math.floor(item.maxAttempts)
+        : Math.max(1, this.maxRetries);
+
+    if (item.attempts < maxAttempts) {
       // Re-enqueue with small exponential backoff
       const backoffDelay = Math.min(1000, 50 * 2 ** item.attempts);
       setTimeout(() => {
-        queue.enqueue(item);
+        if (!this.isRunning) {
+          this.finalizeFailure(worker, item, dlq, `${reason} (Worker pool stopped before retry)`);
+          return;
+        }
+        if (!queue.enqueue(item)) {
+          // Never drop retried work silently: if the buffer is full at retry
+          // time, fall through to the DLQ so it can be replayed later.
+          this.finalizeFailure(worker, item, dlq, `${reason} (Buffer full during retry)`);
+        }
       }, backoffDelay);
     } else {
       // Retries exhausted -> route to DLQ!
-      dlq.push(item, `${reason} (Exhausted ${item.attempts} retries)`);
+      this.finalizeFailure(worker, item, dlq, reason);
     }
+  }
+
+  public getMaxConcurrencyPerWorker(): number {
+    return this.maxConcurrencyPerWorker;
+  }
+
+  public getOptions(): WorkerPoolOptions {
+    return {
+      workerCount: this.workers.length,
+      routingStrategy: this.routingStrategy,
+      circuitFailureThreshold: this.circuitFailureThreshold,
+      circuitRecoveryTimeMs: this.circuitRecoveryTimeMs,
+      maxRetries: this.maxRetries,
+      mockDownstreamLatencyMs: this.mockLatencyMs,
+      mockDownstreamFailureRate: this.mockFailureRate,
+      maxConcurrencyPerWorker: this.maxConcurrencyPerWorker,
+    };
   }
 
   public getWorkers(): WorkerInfo[] {

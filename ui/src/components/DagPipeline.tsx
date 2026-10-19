@@ -7,8 +7,6 @@ import {
   Position,
   ReactFlow,
   ReactFlowProvider,
-  useEdgesState,
-  useNodesState,
   useReactFlow,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
@@ -34,6 +32,7 @@ interface DagPipelineProps {
   workers: TelemetryFrame['workers'];
   trafficActive: boolean;
   routingStrategy: string;
+  maxConcurrencyPerWorker?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -66,11 +65,13 @@ interface WorkerClusterNodeData extends Record<string, unknown> {
   routingStrategy: string;
   trafficActive: boolean;
   drainedRps: number;
+  maxConcurrencyPerWorker: number;
 }
 
 interface IndividualWorkerNodeData extends Record<string, unknown> {
   worker: TelemetryFrame['workers'][number];
   trafficActive: boolean;
+  maxConcurrencyPerWorker: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +140,7 @@ const PipelineStageNode: React.FC<NodeProps<Node<StageNodeData>>> = ({ data }) =
 const WorkerClusterNode: React.FC<NodeProps<Node<WorkerClusterNodeData>>> = ({ data }) => {
   const { workers, routingStrategy } = data;
   const openBreakers = workers.filter((w) => w.circuitState === 'OPEN').length;
-  const concurrencyLimit = 20;
+  const concurrencyLimit = data.maxConcurrencyPerWorker || 25;
 
   return (
     <div className="dag-node-card bg-[#0b101b]/95 backdrop-blur-md border border-white/15 rounded-2xl p-4 shadow-2xl min-w-[680px] max-w-[820px] transition-all">
@@ -298,7 +299,7 @@ const WorkerClusterNode: React.FC<NodeProps<Node<WorkerClusterNodeData>>> = ({ d
 
 const IndividualWorkerNode: React.FC<NodeProps<Node<IndividualWorkerNodeData>>> = ({ data }) => {
   const { worker: w } = data;
-  const concurrencyLimit = 20;
+  const concurrencyLimit = data.maxConcurrencyPerWorker || 25;
   const loadPct = Math.min(100, Math.round((w.activeJobs / concurrencyLimit) * 100));
 
   return (
@@ -410,6 +411,7 @@ const DagFlowInner: React.FC<DagPipelineProps & { viewMode: 'cluster' | 'mesh' }
   workers,
   trafficActive,
   routingStrategy,
+  maxConcurrencyPerWorker = 25,
   viewMode,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -432,6 +434,44 @@ const DagFlowInner: React.FC<DagPipelineProps & { viewMode: 'cluster' | 'mesh' }
 
     return { width, height };
   }, [workers.length]);
+
+  // Dagre layout is structural, not telemetry-driven. Recomputing it on every
+  // 250ms frame was the main cost of the mesh view.
+  const workerIdsKey = workers.map((w) => w.id).join('|');
+  const meshPositions = useMemo(() => {
+    const positions = new Map<string, { x: number; y: number }>();
+    if (viewMode !== 'mesh') return positions;
+
+    const g = new dagre.graphlib.Graph();
+    g.setGraph({ rankdir: 'LR', nodesep: 24, ranksep: 50 });
+    g.setDefaultEdgeLabel(() => ({}));
+
+    g.setNode('traffic', { width: 160, height: 85 });
+    g.setNode('ingress', { width: 160, height: 85 });
+    g.setNode('buffer', { width: 160, height: 85 });
+    g.setNode('router', { width: 160, height: 85 });
+    for (const id of workerIdsKey.split('|').filter(Boolean)) {
+      g.setNode(`w-${id}`, { width: 175, height: 85 });
+    }
+    g.setNode('downstream', { width: 160, height: 85 });
+    g.setNode('dlq', { width: 160, height: 85 });
+
+    g.setEdge('traffic', 'ingress');
+    g.setEdge('ingress', 'buffer');
+    g.setEdge('buffer', 'router');
+    for (const id of workerIdsKey.split('|').filter(Boolean)) {
+      g.setEdge('router', `w-${id}`);
+      g.setEdge(`w-${id}`, 'downstream');
+      g.setEdge(`w-${id}`, 'dlq');
+    }
+
+    dagre.layout(g);
+    for (const id of g.nodes()) {
+      const node = g.node(id);
+      if (node) positions.set(id, { x: node.x, y: node.y });
+    }
+    return positions;
+  }, [viewMode, workerIdsKey]);
 
   // Build nodes & edges based on active viewMode
   const buildGraphElements = useCallback(() => {
@@ -517,6 +557,7 @@ const DagFlowInner: React.FC<DagPipelineProps & { viewMode: 'cluster' | 'mesh' }
             routingStrategy,
             trafficActive,
             drainedRps: metrics.drainedRps,
+            maxConcurrencyPerWorker,
           } as WorkerClusterNodeData,
         },
         {
@@ -605,37 +646,9 @@ const DagFlowInner: React.FC<DagPipelineProps & { viewMode: 'cluster' | 'mesh' }
       return { nodes: clusterNodes, edges: clusterEdges };
     }
 
-    // Mesh view: compute using Dagre graph layout
-    const g = new dagre.graphlib.Graph();
-    g.setGraph({ rankdir: 'LR', nodesep: 24, ranksep: 50 });
-    g.setDefaultEdgeLabel(() => ({}));
-
-    g.setNode('traffic', { width: 160, height: 85 });
-    g.setNode('ingress', { width: 160, height: 85 });
-    g.setNode('buffer', { width: 160, height: 85 });
-    g.setNode('router', { width: 160, height: 85 });
-
-    for (const w of workers) {
-      g.setNode(`w-${w.id}`, { width: 175, height: 85 });
-    }
-
-    g.setNode('downstream', { width: 160, height: 85 });
-    g.setNode('dlq', { width: 160, height: 85 });
-
-    g.setEdge('traffic', 'ingress');
-    g.setEdge('ingress', 'buffer');
-    g.setEdge('buffer', 'router');
-
-    for (const w of workers) {
-      g.setEdge('router', `w-${w.id}`);
-      g.setEdge(`w-${w.id}`, 'downstream');
-      g.setEdge(`w-${w.id}`, 'dlq');
-    }
-
-    dagre.layout(g);
-
+    // Mesh view: use the memoized Dagre layout (not recomputed per frame)
     const getPos = (id: string, width: number, height: number) => {
-      const node = g.node(id);
+      const node = meshPositions.get(id);
       if (!node) return { x: 0, y: 0 };
       return {
         x: Math.round(node.x - width / 2),
@@ -723,6 +736,7 @@ const DagFlowInner: React.FC<DagPipelineProps & { viewMode: 'cluster' | 'mesh' }
         data: {
           worker: w,
           trafficActive,
+          maxConcurrencyPerWorker,
         } as IndividualWorkerNodeData,
       })),
       {
@@ -832,20 +846,15 @@ const DagFlowInner: React.FC<DagPipelineProps & { viewMode: 'cluster' | 'mesh' }
     workers,
     routingStrategy,
     openBreakers,
+    meshPositions,
+    maxConcurrencyPerWorker,
   ]);
 
-  const initial = useMemo(() => buildGraphElements(), [buildGraphElements]);
-  const [nodes, setNodes, onNodesChange] = useNodesState(initial.nodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(initial.edges);
+  // React Flow is fully controlled here (no dragging/connecting/selection), so
+  // there is no need for the nodes/edges state hooks and their sync effect.
+  const { nodes, edges } = buildGraphElements();
 
-  // Sync state whenever viewMode or graph elements change
-  useEffect(() => {
-    const updated = buildGraphElements();
-    setNodes(updated.nodes);
-    setEdges(updated.edges);
-  }, [buildGraphElements, setNodes, setEdges]);
-
-  // Auto-fit view on resize or viewMode change
+  // Auto-fit view on resize or viewMode change (debounced)
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -854,14 +863,19 @@ const DagFlowInner: React.FC<DagPipelineProps & { viewMode: 'cluster' | 'mesh' }
       fitView({ padding: 0.1, duration: 250 });
     }, 60);
 
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     const observer = new ResizeObserver(() => {
-      fitView({ padding: 0.1 });
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        fitView({ padding: 0.1 });
+      }, 150);
     });
 
     observer.observe(el);
 
     return () => {
       clearTimeout(timer);
+      if (resizeTimer) clearTimeout(resizeTimer);
       observer.disconnect();
     };
   }, [fitView, viewMode]);
@@ -884,8 +898,6 @@ const DagFlowInner: React.FC<DagPipelineProps & { viewMode: 'cluster' | 'mesh' }
         nodes={nodes}
         edges={edges}
         nodeTypes={nodeTypes}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
         nodesDraggable={false}
         nodesConnectable={false}
         elementsSelectable={false}

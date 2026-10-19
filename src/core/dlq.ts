@@ -43,7 +43,7 @@ export class DeadLetterQueue {
     const index = this.items.findIndex((item) => item.id === id);
     if (index === -1) return false;
 
-    const [record] = this.items.splice(index, 1);
+    const record = this.items[index];
     // Reset attempts and timestamp for replaying
     const replayedPayload: IngressPayload = {
       ...record.originalPayload,
@@ -51,13 +51,19 @@ export class DeadLetterQueue {
       enqueuedAt: Date.now(),
     };
 
-    return queue.enqueue(replayedPayload);
+    // Only remove the DLQ record once the payload is safely in the buffer.
+    // Otherwise a full buffer would silently destroy the dead-letter entry.
+    if (!queue.enqueue(replayedPayload)) return false;
+
+    this.items.splice(index, 1);
+    return true;
   }
 
   public replayAll(queue: BufferQueue): number {
     let replayedCount = 0;
+    // Array is newest-first, so pop() replays oldest-first (FIFO).
     while (this.items.length > 0) {
-      const record = this.items.pop();
+      const record = this.items[this.items.length - 1];
       if (!record) break;
 
       const replayedPayload: IngressPayload = {
@@ -66,9 +72,11 @@ export class DeadLetterQueue {
         enqueuedAt: Date.now(),
       };
 
-      if (queue.enqueue(replayedPayload)) {
-        replayedCount++;
-      }
+      // Stop on backpressure and keep the remaining records in the DLQ.
+      if (!queue.enqueue(replayedPayload)) break;
+
+      this.items.pop();
+      replayedCount++;
     }
     return replayedCount;
   }

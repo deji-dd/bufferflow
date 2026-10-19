@@ -6,13 +6,17 @@ import { computePercentiles, MetricsCollector } from './metrics';
 import { TokenBucketRateLimiter } from './rate-limiter';
 import { TrafficClient } from './traffic-client';
 import type {
+  ConfigPatch,
   FullSuiteResults,
   IngressPayload,
   RoutingStrategy,
   StrategyBenchmark,
   SuiteProgress,
   SystemConfig,
+  TelemetryFrame,
+  TrafficConfig,
 } from './types';
+import { isRoutingStrategy } from './types';
 import { WorkerPool } from './worker-pool';
 
 const DEFAULT_CONFIG: SystemConfig = {
@@ -26,7 +30,16 @@ const DEFAULT_CONFIG: SystemConfig = {
   maxRetries: 3,
   mockDownstreamLatencyMs: 12,
   mockDownstreamFailureRate: 5,
+  maxConcurrencyPerWorker: 25,
 };
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
 
 const SUITE_STRATEGIES: RoutingStrategy[] = [
   'LEAST_CONNECTIONS',
@@ -113,6 +126,12 @@ export class SimulationSession {
   private suiteStrategyLatencies: Map<string, number[]> = new Map();
   public lastCompletedSuiteResults: FullSuiteResults | null = null;
 
+  // Snapshot taken when a suite starts, restored when it ends so a completed
+  // benchmark never contaminates the next manual run.
+  private preSuiteConfig: SystemConfig | null = null;
+  private preSuiteTrafficConfig: TrafficConfig | null = null;
+  private suiteGeneration: number = 0;
+
   constructor(id: string, port: number) {
     this.id = id;
     this.config = { ...DEFAULT_CONFIG };
@@ -142,6 +161,7 @@ export class SimulationSession {
       maxRetries: this.config.maxRetries,
       mockDownstreamLatencyMs: this.config.mockDownstreamLatencyMs,
       mockDownstreamFailureRate: this.config.mockDownstreamFailureRate,
+      maxConcurrencyPerWorker: this.config.maxConcurrencyPerWorker,
     });
 
     this.workerPool.setEventProcessedCallback((item, success) => {
@@ -182,10 +202,9 @@ export class SimulationSession {
 
   public removeSocket(ws: any): void {
     this.sockets.delete(ws);
-    if (this.sockets.size === 0 && !this.isSuiteRunning && this.tickTimer) {
-      clearTimeout(this.tickTimer);
-      this.tickTimer = null;
-    }
+    // The scheduler decides whether ticking should continue (it may still be
+    // needed for an API-only run or a running suite).
+    this.scheduleNextTick();
   }
 
   public scheduleNextTick(): void {
@@ -193,13 +212,16 @@ export class SimulationSession {
       clearTimeout(this.tickTimer);
       this.tickTimer = null;
     }
-    if (this.sockets.size === 0 && !this.isSuiteRunning) return;
 
     const isBusy =
       this.trafficClient.isActive() ||
       this.isSuiteRunning ||
       this.bufferQueue.getDepth() > 0 ||
       this.workerPool.getActiveJobCount() > 0;
+
+    // Keep sampling while work is happening even without a browser connected,
+    // so suite peaks and /api/metrics are accurate for API-only runs.
+    if (this.sockets.size === 0 && !isBusy) return;
 
     const delay = isBusy ? 250 : 1000;
 
@@ -209,17 +231,40 @@ export class SimulationSession {
     }, delay);
   }
 
+  /**
+   * Builds the current frame without rolling the metrics window. Used by the
+   * initial WebSocket frame and by GET /api/metrics so they cannot distort the
+   * scheduler's 250ms measurements.
+   */
+  public getTelemetrySnapshot(): TelemetryFrame {
+    const frame = this.metricsCollector.snapshot(
+      this.bufferQueue,
+      this.dlq,
+      this.workerPool.getWorkers(),
+      this.workerPool.getRoutingStrategy(),
+      this.trafficClient.isActive(),
+      this.trafficClient.getConfig().targetRps,
+      this.workerPool.getMaxConcurrencyPerWorker()
+    );
+
+    frame.burstProgress = this.trafficClient.getProgress();
+    frame.suiteProgress = this.getSuiteProgress();
+    frame.isServerRunningTest = this.isSuiteRunning;
+    return frame;
+  }
+
   public broadcastTelemetry(): void {
-    if (this.sockets.size === 0 && !this.isSuiteRunning) return;
     this.lastActive = Date.now();
 
+    // The scheduler is the single owner of window rollover.
     const frame = this.metricsCollector.tick(
       this.bufferQueue,
       this.dlq,
       this.workerPool.getWorkers(),
       this.workerPool.getRoutingStrategy(),
       this.trafficClient.isActive(),
-      this.trafficClient.getConfig().targetRps
+      this.trafficClient.getConfig().targetRps,
+      this.workerPool.getMaxConcurrencyPerWorker()
     );
 
     if (this.isSuiteRunning) {
@@ -231,9 +276,8 @@ export class SimulationSession {
     frame.burstProgress = this.trafficClient.getProgress();
     frame.suiteProgress = this.getSuiteProgress();
     frame.isServerRunningTest = this.isSuiteRunning;
-    if (this.lastCompletedSuiteResults) {
-      frame.suiteResults = this.lastCompletedSuiteResults;
-    }
+    // Suite results are deliberately NOT broadcast every frame; the client
+    // fetches them on demand when a run completes.
 
     if (this.sockets.size > 0) {
       const str = JSON.stringify(frame);
@@ -304,6 +348,9 @@ export class SimulationSession {
     this.metricsCollector.recordIngress(elapsedLatency);
 
     if (!enqueued) {
+      // Roll back the idempotency record: the request was rejected with 503, so
+      // the client must be able to retry with the same Idempotency-Key later.
+      this.idempotencyStore.remove(idempotencyKey);
       return {
         status: 503,
         body: {
@@ -328,6 +375,165 @@ export class SimulationSession {
     };
   }
 
+  /**
+   * Applies a validated runtime patch. Only defined fields are touched; numeric
+   * values are clamped and unknown routing strategies are ignored. Returns the
+   * effective system config.
+   */
+  public applyConfigPatch(patch: ConfigPatch = {}): SystemConfig {
+    const next = this.config;
+    const trafficPatch: Partial<TrafficConfig> = {};
+
+    let ratesChanged = false;
+    let bufferChanged = false;
+
+    if (isFiniteNumber(patch.rateLimitPerSec)) {
+      next.rateLimitPerSec = clampNumber(patch.rateLimitPerSec, 1, 1_000_000);
+      ratesChanged = true;
+    }
+    if (isFiniteNumber(patch.rateLimitBurst)) {
+      next.rateLimitBurst = clampNumber(patch.rateLimitBurst, 1, 1_000_000);
+      ratesChanged = true;
+    }
+    if (isFiniteNumber(patch.bufferCapacity)) {
+      next.bufferCapacity = clampNumber(patch.bufferCapacity, 1, 10_000_000);
+      bufferChanged = true;
+    }
+    if (isFiniteNumber(patch.workerCount)) {
+      next.workerCount = clampNumber(patch.workerCount, 1, 64);
+    }
+    if (isRoutingStrategy(patch.routingStrategy)) {
+      next.routingStrategy = patch.routingStrategy;
+    }
+    if (isFiniteNumber(patch.circuitFailureThreshold)) {
+      next.circuitFailureThreshold = clampNumber(patch.circuitFailureThreshold, 1, 1_000_000);
+    }
+    if (isFiniteNumber(patch.circuitRecoveryTimeMs)) {
+      next.circuitRecoveryTimeMs = clampNumber(patch.circuitRecoveryTimeMs, 10, 3_600_000);
+    }
+    if (isFiniteNumber(patch.maxRetries)) {
+      next.maxRetries = clampNumber(patch.maxRetries, 1, 10);
+    }
+    if (isFiniteNumber(patch.maxConcurrencyPerWorker)) {
+      next.maxConcurrencyPerWorker = clampNumber(patch.maxConcurrencyPerWorker, 1, 1000);
+    }
+
+    // `failureRate`/`downstreamLatencyMs` are the traffic-generator names;
+    // `mockDownstream*` are the system-config names. Accept both.
+    const effectiveFailure =
+      patch.failureRate !== undefined ? patch.failureRate : patch.mockDownstreamFailureRate;
+    if (isFiniteNumber(effectiveFailure)) {
+      const clamped = clampNumber(effectiveFailure, 0, 100);
+      next.mockDownstreamFailureRate = clamped;
+      trafficPatch.failureRate = clamped;
+    }
+
+    const effectiveLatency =
+      patch.downstreamLatencyMs !== undefined
+        ? patch.downstreamLatencyMs
+        : patch.mockDownstreamLatencyMs;
+    if (isFiniteNumber(effectiveLatency)) {
+      const clamped = clampNumber(effectiveLatency, 0, 5000);
+      next.mockDownstreamLatencyMs = clamped;
+      trafficPatch.downstreamLatencyMs = clamped;
+    }
+
+    if (isFiniteNumber(patch.targetRps)) {
+      trafficPatch.targetRps = clampNumber(patch.targetRps, 10, 20_000);
+    }
+    if (isFiniteNumber(patch.durationSec)) {
+      trafficPatch.durationSec = clampNumber(patch.durationSec, 0, 86_400);
+    }
+    if (typeof patch.isUnlimited === 'boolean') {
+      trafficPatch.isUnlimited = patch.isUnlimited;
+    }
+    if (typeof patch.schemaType === 'string' && patch.schemaType.trim()) {
+      trafficPatch.schemaType = patch.schemaType.trim();
+    }
+    if (isFiniteNumber(patch.idempotencyCollisionRate)) {
+      trafficPatch.idempotencyCollisionRate = clampNumber(patch.idempotencyCollisionRate, 0, 100);
+    }
+
+    if (ratesChanged) {
+      this.rateLimiter.updateConfig(next.rateLimitPerSec, next.rateLimitBurst);
+    }
+    if (bufferChanged) {
+      this.bufferQueue.setCapacity(next.bufferCapacity);
+    }
+
+    this.workerPool.updateConfig({
+      workerCount: next.workerCount,
+      routingStrategy: next.routingStrategy,
+      circuitFailureThreshold: next.circuitFailureThreshold,
+      circuitRecoveryTimeMs: next.circuitRecoveryTimeMs,
+      maxRetries: next.maxRetries,
+      mockDownstreamLatencyMs: next.mockDownstreamLatencyMs,
+      mockDownstreamFailureRate: next.mockDownstreamFailureRate,
+      maxConcurrencyPerWorker: next.maxConcurrencyPerWorker,
+    });
+
+    if (Object.keys(trafficPatch).length > 0) {
+      this.trafficClient.updateConfig(trafficPatch);
+    }
+
+    return { ...next };
+  }
+
+  /**
+   * Starts a manual load run, applying the requested runtime config first so
+   * the dashboard's failure/latency/worker/strategy controls take effect on
+   * start (not only when a slider is moved).
+   */
+  public startManualRun(config: ConfigPatch = {}): { success: boolean; message: string } {
+    if (this.isSuiteRunning) {
+      return {
+        success: false,
+        message: 'A full suite stress test is already running. Stop it first.',
+      };
+    }
+
+    this.applyConfigPatch(config);
+    this.resetRunHistory();
+    this.clearLastSuiteResults();
+    const result = this.trafficClient.start({});
+    this.scheduleNextTick();
+    return result;
+  }
+
+  public clearLastSuiteResults(): void {
+    this.lastCompletedSuiteResults = null;
+  }
+
+  /**
+   * Restores the config snapshot captured before a suite started, so an
+   * automated benchmark cannot leak Level 4 latency/failure settings into the
+   * next manual run.
+   */
+  private restorePreSuiteConfig(): void {
+    const snapshot = this.preSuiteConfig;
+    const trafficSnapshot = this.preSuiteTrafficConfig;
+    this.preSuiteConfig = null;
+    this.preSuiteTrafficConfig = null;
+    if (!snapshot) return;
+
+    Object.assign(this.config, snapshot);
+    this.rateLimiter.updateConfig(snapshot.rateLimitPerSec, snapshot.rateLimitBurst);
+    this.bufferQueue.setCapacity(snapshot.bufferCapacity);
+    this.workerPool.updateConfig({
+      workerCount: snapshot.workerCount,
+      routingStrategy: snapshot.routingStrategy,
+      circuitFailureThreshold: snapshot.circuitFailureThreshold,
+      circuitRecoveryTimeMs: snapshot.circuitRecoveryTimeMs,
+      maxRetries: snapshot.maxRetries,
+      mockDownstreamLatencyMs: snapshot.mockDownstreamLatencyMs,
+      mockDownstreamFailureRate: snapshot.mockDownstreamFailureRate,
+      maxConcurrencyPerWorker: snapshot.maxConcurrencyPerWorker,
+    });
+    if (trafficSnapshot) {
+      this.trafficClient.updateConfig(trafficSnapshot);
+    }
+  }
+
   public startFullSuiteTest(
     options: number | FullSuiteStressOptions = 5,
     legacyTargetRps = 2500
@@ -338,6 +544,13 @@ export class SimulationSession {
   } {
     this.stopFullSuiteTest();
     this.resetRunHistory();
+
+    // Snapshot the user's config before the suite mutates latency/failure/
+    // worker settings per level, so it can be restored afterwards.
+    this.preSuiteConfig = { ...this.config };
+    this.preSuiteTrafficConfig = this.trafficClient.getConfig();
+    this.suiteGeneration++;
+    const suiteGeneration = this.suiteGeneration;
 
     const isObject = typeof options === 'object' && options !== null;
     const runAllLevels = isObject && !!options.runAllLevels;
@@ -405,7 +618,7 @@ export class SimulationSession {
     this.suitePeakAcceptedRps = 0;
     this.suitePeakDrainedRps = 0;
     this.suiteStrategyBreakdown = {};
-    this.lastCompletedSuiteResults = null;
+    this.clearLastSuiteResults();
     this.suiteStrategyLatencies.clear();
 
     const firstStrategy = SUITE_STRATEGIES[0];
@@ -433,9 +646,10 @@ export class SimulationSession {
       downstreamLatencyMs,
       idempotencyCollisionRate,
     });
+    this.scheduleNextTick();
 
-    const runNextStep = () => {
-      if (!this.isSuiteRunning) return;
+    const runNextStep = async () => {
+      if (!this.isSuiteRunning || this.suiteGeneration !== suiteGeneration) return;
 
       const currentStrat = SUITE_STRATEGIES[this.suiteStrategyIndexInLevel];
       const currentLevel = this.isMultiLevelRun
@@ -444,13 +658,20 @@ export class SimulationSession {
           ? options.stressLevel
           : 1;
 
+      // Stop generating new ingress, then let every accepted item finish under
+      // the current strategy. Nothing is purged: leftover work (only possible
+      // if the bounded drain times out) carries over to the next strategy.
+      this.trafficClient.stop();
+      await this.drainSuiteWork(5000, suiteGeneration);
+
+      if (!this.isSuiteRunning || this.suiteGeneration !== suiteGeneration) return;
+
       if (currentStrat) {
         this.recordCurrentStrategyBenchmark(currentStrat, currentLevel);
       }
 
-      // CRITICAL SAFEGUARD: Purge buffer and reset workers between every strategy switch
-      // so each algorithm begins on a pristine buffer baseline (depth 0, no inherited dwell lag)
-      this.bufferQueue.clear();
+      // Workers are idle after a successful drain; reset circuit/rotation state
+      // so the next strategy starts from a clean router state.
       this.workerPool.resetStrategyWindow();
       this.metricsCollector.resetLatencySamples();
 
@@ -485,25 +706,10 @@ export class SimulationSession {
       }
 
       if (isDone) {
-        // Stop generating new ingress traffic immediately
-        this.trafficClient.stop();
-
-        // Allow active in-flight worker jobs to finish draining gracefully before final snapshot
-        const drainAndFinalize = async () => {
-          const startDrain = Date.now();
-          const maxDrainWaitMs = 2500;
-          while (
-            (this.bufferQueue.getDepth() > 0 || this.workerPool.getActiveJobCount() > 0) &&
-            Date.now() - startDrain < maxDrainWaitMs
-          ) {
-            await new Promise((resolve) => setTimeout(resolve, 20));
-          }
-
-          this.compileFullSuiteResults('completed');
-          this.isSuiteRunning = false;
-        };
-
-        drainAndFinalize();
+        this.compileFullSuiteResults('completed');
+        this.restorePreSuiteConfig();
+        this.isSuiteRunning = false;
+        this.scheduleNextTick();
         return;
       }
 
@@ -511,10 +717,18 @@ export class SimulationSession {
       this.config.routingStrategy = nextStrategy;
       this.workerPool.updateConfig({ routingStrategy: nextStrategy });
 
-      this.suiteStepTimer = setTimeout(runNextStep, this.suiteStepDurationSec * 1000);
+      // Restart traffic for the next strategy. The benchmark baseline was reset
+      // by recordCurrentStrategyBenchmark() after the drain completed.
+      this.trafficClient.start({});
+      this.scheduleNextTick();
+      this.suiteStepTimer = setTimeout(() => {
+        void runNextStep();
+      }, this.suiteStepDurationSec * 1000);
     };
 
-    this.suiteStepTimer = setTimeout(runNextStep, this.suiteStepDurationSec * 1000);
+    this.suiteStepTimer = setTimeout(() => {
+      void runNextStep();
+    }, this.suiteStepDurationSec * 1000);
 
     const totalBenchmarks = this.isMultiLevelRun
       ? SUITE_STRATEGIES.length * 4
@@ -522,14 +736,41 @@ export class SimulationSession {
     const totalDurationSec = totalBenchmarks * this.suiteStepDurationSec;
 
     const message = this.isMultiLevelRun
-      ? `Server Automated Matrix Test started: cycling through all 4 difficulty levels × 7 strategies (${totalBenchmarks} benchmarks total, ${this.suiteStepDurationSec}s each, ${totalDurationSec}s total). Buffer purged between steps.`
-      : `Server stress test started: cycling through all ${SUITE_STRATEGIES.length} routing strategies (${this.suiteStepDurationSec}s each, ${totalDurationSec}s total). Buffer purged between steps.`;
+      ? `Server Automated Matrix Test started: cycling through all 4 difficulty levels × 7 strategies (${totalBenchmarks} benchmarks total, ${this.suiteStepDurationSec}s each, ${totalDurationSec}s total). Traffic drained between steps.`
+      : `Server stress test started: cycling through all ${SUITE_STRATEGIES.length} routing strategies (${this.suiteStepDurationSec}s each, ${totalDurationSec}s total). Traffic drained between steps.`;
 
     return {
       success: true,
       message,
       totalDurationSec,
     };
+  }
+
+  /**
+   * Waits for the buffer and in-flight worker jobs to settle before switching
+   * strategies. Bounded so a stuck downstream cannot stall the suite forever;
+   * any leftover work is carried forward rather than purged.
+   */
+  private async drainSuiteWork(maxWaitMs: number, generation: number): Promise<void> {
+    const startedAt = Date.now();
+    while (
+      this.isSuiteRunning &&
+      this.suiteGeneration === generation &&
+      (this.bufferQueue.getDepth() > 0 || this.workerPool.getActiveJobCount() > 0) &&
+      Date.now() - startedAt < maxWaitMs
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    if (
+      this.isSuiteRunning &&
+      this.suiteGeneration === generation &&
+      (this.bufferQueue.getDepth() > 0 || this.workerPool.getActiveJobCount() > 0)
+    ) {
+      console.warn(
+        `[Bufferflow Suite] Drain wait exceeded ${maxWaitMs}ms; carrying ${this.bufferQueue.getDepth()} queued item(s) into the next strategy.`
+      );
+    }
   }
 
   private recordCurrentStrategyBenchmark(strat: RoutingStrategy, level: number = 1): void {
@@ -668,9 +909,9 @@ export class SimulationSession {
         totalAccepted: totals.totalAccepted,
         totalProcessed: totals.totalProcessed,
         totalFailed: totals.totalFailed,
-        peakIncomingRps: this.suitePeakIncomingRps || this.suiteTargetRps,
-        peakAcceptedRps: this.suitePeakAcceptedRps || this.suiteTargetRps,
-        peakDrainedRps: this.suitePeakDrainedRps || this.suiteTargetRps,
+        peakIncomingRps: this.suitePeakIncomingRps,
+        peakAcceptedRps: this.suitePeakAcceptedRps,
+        peakDrainedRps: this.suitePeakDrainedRps,
         p50LatencyMs: totals.p50LatencyMs,
         p95LatencyMs: totals.p95LatencyMs,
         p99LatencyMs: totals.p99LatencyMs,
@@ -694,21 +935,37 @@ export class SimulationSession {
       clearTimeout(this.suiteStepTimer);
       this.suiteStepTimer = null;
     }
-    if (!this.isSuiteRunning) return this.lastCompletedSuiteResults;
+    // Returning cached results here made a plain manual-run stop look like a
+    // suite run. Callers that want the last result use getLastSuiteResults().
+    if (!this.isSuiteRunning) return null;
 
     this.isSuiteRunning = false;
     this.trafficClient.stop();
     const currentStrat = SUITE_STRATEGIES[this.suiteStrategyIndexInLevel];
     const currentLevel = this.isMultiLevelRun ? this.suiteCurrentLevelIndex + 1 : 1;
-    if (currentStrat) {
+    if (currentStrat && this.suiteStrategyIndexInLevel < SUITE_STRATEGIES.length) {
       this.recordCurrentStrategyBenchmark(currentStrat, currentLevel);
     }
     const results = this.compileFullSuiteResults(reason);
+    this.restorePreSuiteConfig();
+    this.scheduleNextTick();
     return results;
   }
 
   public getLastSuiteResults(): FullSuiteResults | null {
     return this.lastCompletedSuiteResults;
+  }
+
+  /**
+   * Safety fallback for the last browser socket going away. Stops both the
+   * suite and manual traffic so no orphaned timer keeps running with no client.
+   */
+  public stopForDisconnect(
+    reason: FullSuiteResults['completedReason'] = 'safety_fallback_unload'
+  ): void {
+    this.stopFullSuiteTest(reason);
+    this.trafficClient.stop();
+    this.scheduleNextTick();
   }
 
   public isServerRunningSuite(): boolean {
@@ -753,12 +1010,14 @@ export class SimulationSession {
     this.lastActive = Date.now();
   }
 
-  public destroy() {
+  public destroy(reason: FullSuiteResults['completedReason'] = 'stopped_by_user') {
     if (this.tickTimer) {
-      clearInterval(this.tickTimer);
+      clearTimeout(this.tickTimer);
       this.tickTimer = null;
     }
-    this.stopFullSuiteTest();
+    this.stopFullSuiteTest(reason);
+    // An API-only run (no sockets) must not keep pacing into a destroyed pool.
+    this.trafficClient.stop();
     this.workerPool.stop();
     this.sockets.clear();
   }
@@ -767,26 +1026,47 @@ export class SimulationSession {
 export class SessionManager {
   private sessions: Map<string, SimulationSession> = new Map();
   private port: number;
+  private maxSessions: number;
 
-  constructor(port: number) {
+  constructor(port: number, maxSessions: number = 100) {
     this.port = port;
+    this.maxSessions = maxSessions;
 
     // Cleanup stale sessions after 15 minutes of inactivity
     setInterval(() => {
       const cutoff = Date.now() - 15 * 60 * 1000;
       for (const [id, session] of this.sessions.entries()) {
         if (session.sockets.size === 0 && session.lastActive < cutoff) {
-          session.destroy();
+          session.destroy('safety_fallback_unload');
           this.sessions.delete(id);
         }
       }
     }, 60000);
   }
 
+  private evictOldestIdleSession(): void {
+    let oldestId: string | null = null;
+    let oldestAt = Number.POSITIVE_INFINITY;
+    for (const [id, session] of this.sessions.entries()) {
+      if (session.sockets.size > 0) continue;
+      if (session.lastActive < oldestAt) {
+        oldestAt = session.lastActive;
+        oldestId = id;
+      }
+    }
+    if (oldestId) {
+      this.sessions.get(oldestId)?.destroy();
+      this.sessions.delete(oldestId);
+    }
+  }
+
   public getOrCreate(id: string = 'default'): SimulationSession {
     const cleanId = id.trim() || 'default';
     let session = this.sessions.get(cleanId);
     if (!session) {
+      if (this.sessions.size >= this.maxSessions) {
+        this.evictOldestIdleSession();
+      }
       session = new SimulationSession(cleanId, this.port);
       this.sessions.set(cleanId, session);
     }

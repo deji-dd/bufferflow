@@ -1,5 +1,5 @@
 import type React from 'react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -57,6 +57,12 @@ interface ResultsModalProps {
 export const ResultsModal: React.FC<ResultsModalProps> = ({ isOpen, results, onClose }) => {
   const [copied, setCopied] = useState(false);
   const [selectedLevelTab, setSelectedLevelTab] = useState<number>(0);
+
+  // Reset per-run view state when a different result is opened.
+  useEffect(() => {
+    setSelectedLevelTab(0);
+    setCopied(false);
+  }, [results?.runId]);
 
   if (!isOpen || !results) return null;
 
@@ -193,7 +199,7 @@ export const ResultsModal: React.FC<ResultsModalProps> = ({ isOpen, results, onC
           </span>
           <span>
             Strategy:{' '}
-            <b className="text-[#00f0ff]">{results.config.routingStrategy.replace('_', ' ')}</b>
+            <b className="text-[#00f0ff]">{results.config.routingStrategy.replace(/_/g, ' ')}</b>
           </span>
           <span>
             Workers: <b className="text-[#10b981]">{results.workers.length} Nodes</b>
@@ -217,7 +223,7 @@ export const ResultsModal: React.FC<ResultsModalProps> = ({ isOpen, results, onC
                   : 'BENCHMARK BREAKDOWN'}
               </span>
               <span className="text-[10px] text-[#94a3b8]">
-                Buffer baseline purged between each strategy switch
+                Accepted work drained before each strategy switch
               </span>
             </div>
 

@@ -22,6 +22,62 @@ export interface HistoricalRunSummary {
   createdAt: string;
 }
 
+export function deriveLevelsTested(results: any): number[] | undefined {
+  if (Array.isArray(results?.levelsTested) && results.levelsTested.length > 0) {
+    return results.levelsTested.map(Number).sort((a: number, b: number) => a - b);
+  }
+  const breakdowns = results?.levelBreakdowns;
+  if (breakdowns && typeof breakdowns === 'object') {
+    const levels = Object.keys(breakdowns)
+      .map(Number)
+      .filter((level) => Number.isFinite(level))
+      .sort((a, b) => a - b);
+    if (levels.length > 0) return levels;
+  }
+  return undefined;
+}
+
+/**
+ * Maps a completed run (manual or suite) to a database record. Manual runs must
+ * be stored as STANDARD; previously every run without an explicit testType was
+ * mislabeled FULL_SUITE.
+ */
+export function toTestRunRecord(results: any): NewTestRunRecord {
+  const summary = results.summary || {};
+  const config = results.config || {};
+  const isSuite = results.testType === 'FULL_SUITE';
+
+  return {
+    id: results.id || results.runId,
+    runId: results.runId,
+    sessionId: results.sessionId || 'default',
+    testType: isSuite ? 'FULL_SUITE' : 'STANDARD',
+    isMultiLevel: Boolean(results.isMultiLevel),
+    completedReason: results.completedReason || 'completed',
+    durationSec: Number(results.durationSec) || 0,
+    startedAt: new Date(results.startedAt || Date.now()),
+    completedAt: new Date(results.completedAt || Date.now()),
+    targetRps: Number(config.targetRps) || 0,
+    workerCount: Number(config.workerCount) || 8,
+    peakIncomingRps: Number(summary.peakIncomingRps) || 0,
+    peakAcceptedRps: Number(summary.peakAcceptedRps) || 0,
+    peakDrainedRps: Number(summary.peakDrainedRps) || 0,
+    p50LatencyMs: Math.round(Number(summary.p50LatencyMs) || 0),
+    p95LatencyMs: Math.round(Number(summary.p95LatencyMs) || 0),
+    p99LatencyMs: Math.round(Number(summary.p99LatencyMs) || 0),
+    totalIngressed: Number(summary.totalIngressed) || 0,
+    totalAccepted: Number(summary.totalAccepted) || 0,
+    totalProcessed: Number(summary.totalProcessed) || 0,
+    totalFailed: Number(summary.totalFailed) || 0,
+    summary,
+    config,
+    strategyBreakdown: results.strategyBreakdown || null,
+    levelBreakdowns: results.levelBreakdowns || null,
+    workers: results.workers || null,
+    createdAt: new Date(),
+  };
+}
+
 export class HistoryRepository {
   private inMemoryRuns: Map<string, any> = new Map();
   private maxInMemory: number = 50;
@@ -29,43 +85,7 @@ export class HistoryRepository {
   public async saveTestRun(results: FullSuiteResults | any): Promise<void> {
     if (!results?.runId) return;
 
-    const summary = results.summary || {};
-    const config = results.config || {};
-    const _peakThroughput = Math.max(
-      summary.peakAcceptedRps || 0,
-      summary.peakDrainedRps || 0,
-      summary.peakIncomingRps || 0
-    );
-
-    const record: NewTestRunRecord = {
-      id: results.id || results.runId,
-      runId: results.runId,
-      sessionId: results.sessionId || 'default',
-      testType: results.testType || 'FULL_SUITE',
-      isMultiLevel: Boolean(results.isMultiLevel),
-      completedReason: results.completedReason || 'completed',
-      durationSec: Number(results.durationSec) || 0,
-      startedAt: new Date(results.startedAt || Date.now()),
-      completedAt: new Date(results.completedAt || Date.now()),
-      targetRps: Number(config.targetRps) || 0,
-      workerCount: Number(config.workerCount) || 8,
-      peakIncomingRps: Number(summary.peakIncomingRps) || 0,
-      peakAcceptedRps: Number(summary.peakAcceptedRps) || 0,
-      peakDrainedRps: Number(summary.peakDrainedRps) || 0,
-      p50LatencyMs: Math.round(Number(summary.p50LatencyMs) || 0),
-      p95LatencyMs: Math.round(Number(summary.p95LatencyMs) || 0),
-      p99LatencyMs: Math.round(Number(summary.p99LatencyMs) || 0),
-      totalIngressed: Number(summary.totalIngressed) || 0,
-      totalAccepted: Number(summary.totalAccepted) || 0,
-      totalProcessed: Number(summary.totalProcessed) || 0,
-      totalFailed: Number(summary.totalFailed) || 0,
-      summary: summary,
-      config: config,
-      strategyBreakdown: results.strategyBreakdown || null,
-      levelBreakdowns: results.levelBreakdowns || null,
-      workers: results.workers || null,
-      createdAt: new Date(),
-    };
+    const record = toTestRunRecord(results);
 
     // Save to in-memory store
     this.inMemoryRuns.set(record.runId, results);
@@ -160,7 +180,7 @@ export class HistoryRepository {
       id: r.id || r.runId,
       runId: r.runId,
       sessionId: r.sessionId || 'default',
-      testType: r.testType || 'FULL_SUITE',
+      testType: r.testType || (r.strategyBreakdown ? 'FULL_SUITE' : 'STANDARD'),
       isMultiLevel: Boolean(r.isMultiLevel),
       completedReason: r.completedReason || 'completed',
       durationSec: Number(r.durationSec) || 0,
@@ -199,6 +219,7 @@ export class HistoryRepository {
             sessionId: row.sessionId,
             testType: row.testType,
             isMultiLevel: row.isMultiLevel,
+            levelsTested: deriveLevelsTested({ levelBreakdowns: row.levelBreakdowns }),
             completedReason: row.completedReason,
             durationSec: row.durationSec,
             startedAt: row.startedAt.toISOString(),
@@ -242,10 +263,12 @@ export class HistoryRepository {
     try {
       const db = await getDb();
       if (db && isDbConnected()) {
-        const _res = await db
+        const removed = await db
           .delete(testRunsTable)
-          .where(or(eq(testRunsTable.id, runIdOrId), eq(testRunsTable.runId, runIdOrId)));
-        deleted = true;
+          .where(or(eq(testRunsTable.id, runIdOrId), eq(testRunsTable.runId, runIdOrId)))
+          .returning({ id: testRunsTable.id });
+        // Only report success when a row actually matched.
+        deleted = removed.length > 0;
       }
     } catch (err: any) {
       console.warn(`[Bufferflow History] Error deleting run: ${err?.message}`);

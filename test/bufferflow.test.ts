@@ -189,7 +189,7 @@ describe('Bufferflow Core Engine Test Suite', () => {
       }
     });
 
-    it('resets worker counters with resetCounters()', () => {
+    it('resets worker counters with resetCounters()', async () => {
       const pool = new WorkerPool({
         workerCount: 2,
         routingStrategy: 'ROUND_ROBIN',
@@ -199,15 +199,32 @@ describe('Bufferflow Core Engine Test Suite', () => {
         mockDownstreamLatencyMs: 2,
         mockDownstreamFailureRate: 0,
       });
+      const queue = new BufferQueue(10);
+      const dlq = new DeadLetterQueue(10);
+      pool.start(queue, dlq);
 
-      const workers = pool.getWorkers();
-      workers[0].totalProcessed = 100;
-      workers[0].totalFailed = 10;
+      for (let i = 0; i < 5; i++) {
+        queue.enqueue({
+          id: `reset-${i}`,
+          idempotencyKey: `reset-key-${i}`,
+          enqueuedAt: Date.now(),
+          schemaType: 'test',
+          data: {},
+          attempts: 0,
+          maxAttempts: 3,
+        });
+      }
+      await new Promise((r) => setTimeout(r, 80));
+
+      const before = pool.getWorkers();
+      expect(before.reduce((sum, w) => sum + w.totalProcessed, 0)).toBeGreaterThan(0);
+
       pool.resetCounters();
-
       const resetWorkers = pool.getWorkers();
       expect(resetWorkers[0].totalProcessed).toBe(0);
       expect(resetWorkers[0].totalFailed).toBe(0);
+      expect(resetWorkers.reduce((sum, w) => sum + w.totalProcessed, 0)).toBe(0);
+      pool.stop();
     });
   });
 
@@ -289,7 +306,7 @@ describe('Bufferflow Core Engine Test Suite', () => {
       session.destroy();
     });
 
-    it('supports automated matrix test across all 4 levels and purges buffer between steps', async () => {
+    it('supports automated matrix test across all 4 levels and drains between steps', async () => {
       const { SimulationSession } = await import('../src/core/simulation-session');
       const session = new SimulationSession('matrix-test', 3001);
 

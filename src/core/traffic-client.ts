@@ -47,7 +47,28 @@ export class TrafficClient {
       this.stop();
     }
 
-    this.currentConfig = { ...this.currentConfig, ...config };
+    this.currentConfig = { ...this.currentConfig, ...this.definedOnly(config) };
+
+    // Defend against NaN/undefined values arriving from partial API payloads;
+    // otherwise the pacer multiplies by undefined and silently sends nothing.
+    this.currentConfig.targetRps = Number.isFinite(this.currentConfig.targetRps)
+      ? Math.max(10, this.currentConfig.targetRps)
+      : 10;
+    this.currentConfig.durationSec = Number.isFinite(this.currentConfig.durationSec)
+      ? Math.max(0, this.currentConfig.durationSec)
+      : 15;
+    this.currentConfig.failureRate = Number.isFinite(this.currentConfig.failureRate)
+      ? Math.min(100, Math.max(0, this.currentConfig.failureRate))
+      : 0;
+    this.currentConfig.downstreamLatencyMs = Number.isFinite(this.currentConfig.downstreamLatencyMs)
+      ? Math.min(5000, Math.max(0, this.currentConfig.downstreamLatencyMs))
+      : 0;
+    this.currentConfig.idempotencyCollisionRate = Number.isFinite(
+      this.currentConfig.idempotencyCollisionRate
+    )
+      ? Math.min(100, Math.max(0, this.currentConfig.idempotencyCollisionRate))
+      : 0;
+
     if (config.isUnlimited || this.currentConfig.durationSec <= 0) {
       this.currentConfig.durationSec = 0;
       this.currentConfig.isUnlimited = true;
@@ -57,7 +78,7 @@ export class TrafficClient {
     this.recentKeys = [];
     this.burstStartTime = Date.now();
 
-    const targetRps = Math.max(10, this.currentConfig.targetRps);
+    const targetRps = this.currentConfig.targetRps;
     this.startPacer();
 
     // Auto-stop after durationSec if not unlimited
@@ -102,8 +123,34 @@ export class TrafficClient {
     }, tickIntervalMs);
   }
 
+  /**
+   * Drops explicit `undefined` values so a partial update cannot accidentally
+   * reset unrelated config fields.
+   */
+  private definedOnly(config: Partial<TrafficConfig>): Partial<TrafficConfig> {
+    const defined: Partial<TrafficConfig> = {};
+    for (const [key, value] of Object.entries(config)) {
+      if (value !== undefined) {
+        (defined as Record<string, unknown>)[key] = value;
+      }
+    }
+    return defined;
+  }
+
   public updateConfig(config: Partial<TrafficConfig>): void {
-    this.currentConfig = { ...this.currentConfig, ...config };
+    const patch = this.definedOnly(config);
+    this.currentConfig = { ...this.currentConfig, ...patch };
+
+    if (patch.targetRps !== undefined) {
+      this.currentConfig.targetRps = Number.isFinite(this.currentConfig.targetRps)
+        ? Math.max(10, this.currentConfig.targetRps)
+        : 10;
+    }
+    if (patch.durationSec !== undefined) {
+      this.currentConfig.durationSec = Number.isFinite(this.currentConfig.durationSec)
+        ? Math.max(0, this.currentConfig.durationSec)
+        : 0;
+    }
 
     if (config.isUnlimited !== undefined) {
       if (config.isUnlimited) {
@@ -118,7 +165,7 @@ export class TrafficClient {
       }
     }
 
-    if (this.isRunning && config.targetRps !== undefined) {
+    if (this.isRunning && patch.targetRps !== undefined) {
       this.startPacer();
     }
 

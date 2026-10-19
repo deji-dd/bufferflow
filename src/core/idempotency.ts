@@ -43,6 +43,14 @@ export class IdempotencyStore {
     return Date.now() - existing < this.ttlMs;
   }
 
+  /**
+   * Removes a previously recorded key. Used to roll back the record when the
+   * downstream enqueue fails (e.g. buffer backpressure), so a client can retry.
+   */
+  public remove(key: string): void {
+    this.cache.delete(key);
+  }
+
   public size(): number {
     return this.cache.size;
   }

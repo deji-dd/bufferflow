@@ -11,6 +11,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import { apiFetch } from '@/lib/api';
 
 export interface HistoricalRunItem {
   id: string;
@@ -47,7 +48,7 @@ export const HistoryModal: React.FC<HistoryModalProps> = ({ isOpen, onClose, onS
   const fetchHistory = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/history?limit=50');
+      const res = await apiFetch('/api/history?limit=50');
       const data = await res.json();
       if (data && Array.isArray(data.runs)) {
         setRuns(data.runs);
@@ -72,7 +73,7 @@ export const HistoryModal: React.FC<HistoryModalProps> = ({ isOpen, onClose, onS
     if (!confirm('Are you sure you want to delete this historical benchmark run?')) return;
     setDeletingId(id);
     try {
-      const res = await fetch(`/api/history/${encodeURIComponent(id)}`, {
+      const res = await apiFetch(`/api/history/${encodeURIComponent(id)}`, {
         method: 'DELETE',
       });
       const data = await res.json();

@@ -2,15 +2,21 @@ import type { BufferQueue } from './buffer-queue';
 import type { DeadLetterQueue } from './dlq';
 import type { RoutingStrategy, TelemetryFrame, WorkerInfo } from './types';
 
+/**
+ * Nearest-rank percentile. Using floor(len * p) biases the result upward
+ * (e.g. p50 of [1..100] would be 51 instead of 50).
+ */
 export function computePercentiles(samples: number[]): { p50: number; p95: number; p99: number } {
   if (!samples || samples.length === 0) return { p50: 0, p95: 0, p99: 0 };
   const sorted = [...samples].sort((a, b) => a - b);
   const len = sorted.length;
-  return {
-    p50: Number((sorted[Math.floor(len * 0.5)] ?? 0).toFixed(2)),
-    p95: Number((sorted[Math.floor(len * 0.95)] ?? 0).toFixed(2)),
-    p99: Number((sorted[Math.floor(len * 0.99)] ?? 0).toFixed(2)),
+
+  const at = (p: number) => {
+    const index = Math.min(len - 1, Math.max(0, Math.ceil(p * len) - 1));
+    return Number((sorted[index] ?? 0).toFixed(2));
   };
+
+  return { p50: at(0.5), p95: at(0.95), p99: at(0.99) };
 }
 
 export class MetricsCollector {
@@ -21,10 +27,16 @@ export class MetricsCollector {
   private windowDuplicates: number = 0;
   private windowDrained: number = 0;
 
-  // Latency samples for percentile calculation (ms)
-  private latencySamples: number[] = [];
-  private cumulativeSamples: number[] = [];
-  private maxLatencySamples: number = 2000;
+  // Gateway ingress latency samples for the current window (ms). These feed the
+  // p50/p95/p99 values shown as "Gateway P95" in the dashboard.
+  private ingressSamples: number[] = [];
+  private maxIngressSamples: number = 5000;
+
+  // Downstream processing latency (enqueue -> terminal outcome). These feed the
+  // cumulative/suite benchmarks and are intentionally separate from ingress.
+  private processingSamples: number[] = [];
+  private cumulativeProcessingSamples: number[] = [];
+  private maxProcessingSamples: number = 2000;
   private maxCumulativeSamples: number = 5000;
 
   // Cumulative counters
@@ -46,9 +58,23 @@ export class MetricsCollector {
 
   private lastTickTime: number = performance.now();
 
-  public recordIngress(_latencyMs: number): void {
+  private recordSample(samples: number[], value: number, max: number): void {
+    if (!(value > 0) || !Number.isFinite(value)) return;
+    if (samples.length < max) {
+      samples.push(value);
+      return;
+    }
+    samples[Math.floor(Math.random() * max)] = value;
+  }
+
+  /**
+   * Records one ingress request and its gateway latency. Called for accepted,
+   * rate-limited and duplicate requests alike.
+   */
+  public recordIngress(latencyMs: number): void {
     this.windowIncoming++;
     this.totalIngressed++;
+    this.recordSample(this.ingressSamples, latencyMs, this.maxIngressSamples);
   }
 
   public recordAccepted(): void {
@@ -64,6 +90,10 @@ export class MetricsCollector {
     this.windowDuplicates++;
   }
 
+  /**
+   * Records a terminal job outcome (success or exhausted retries). Retryable
+   * failures are not reported here, so processed + failed <= accepted.
+   */
   public recordJobProcessed(success: boolean, latencyMs?: number): void {
     this.windowDrained++;
     if (success) {
@@ -71,25 +101,16 @@ export class MetricsCollector {
     } else {
       this.totalFailed++;
     }
-    if (latencyMs !== undefined && latencyMs > 0) {
-      if (this.latencySamples.length < this.maxLatencySamples) {
-        this.latencySamples.push(latencyMs);
-      } else {
-        const idx = Math.floor(Math.random() * this.maxLatencySamples);
-        this.latencySamples[idx] = latencyMs;
-      }
 
-      if (this.cumulativeSamples.length < this.maxCumulativeSamples) {
-        this.cumulativeSamples.push(latencyMs);
-      } else {
-        const idx = Math.floor(Math.random() * this.maxCumulativeSamples);
-        this.cumulativeSamples[idx] = latencyMs;
-      }
+    if (latencyMs !== undefined) {
+      this.recordSample(this.processingSamples, latencyMs, this.maxProcessingSamples);
+      this.recordSample(this.cumulativeProcessingSamples, latencyMs, this.maxCumulativeSamples);
     }
   }
 
   /**
-   * Called every 250ms tick to compute instantaneous RPS and percentiles.
+   * Rolls the current 250ms/1s window: computes RPS + ingress percentiles and
+   * resets the window counters. Only the session scheduler should call this.
    */
   public tick(
     bufferQueue: BufferQueue,
@@ -97,7 +118,8 @@ export class MetricsCollector {
     workers: WorkerInfo[],
     routingStrategy: RoutingStrategy,
     trafficActive: boolean,
-    targetRps: number
+    targetRps: number,
+    maxConcurrencyPerWorker: number
   ): TelemetryFrame {
     const now = performance.now();
     const elapsedSec = Math.max(0.001, (now - this.lastTickTime) / 1000);
@@ -117,24 +139,70 @@ export class MetricsCollector {
     this.windowDuplicates = 0;
     this.windowDrained = 0;
 
-    if (this.latencySamples.length > 0) {
-      const { p50, p95, p99 } = computePercentiles(this.latencySamples);
+    if (this.ingressSamples.length > 0) {
+      const { p50, p95, p99 } = computePercentiles(this.ingressSamples);
       this.p50Latency = p50;
       this.p95Latency = p95;
       this.p99Latency = p99;
-      this.latencySamples = [];
+      this.ingressSamples = [];
     } else if (!trafficActive && this.currentIncomingRps === 0) {
       this.p50Latency = 0;
       this.p95Latency = 0;
       this.p99Latency = 0;
     }
 
+    return this.buildFrame(
+      bufferQueue,
+      dlq,
+      workers,
+      routingStrategy,
+      trafficActive,
+      targetRps,
+      maxConcurrencyPerWorker
+    );
+  }
+
+  /**
+   * Returns the current telemetry frame WITHOUT rolling the window. Safe for
+   * multiple consumers (WS connect, REST /api/metrics) because it never steals
+   * samples from the scheduler.
+   */
+  public snapshot(
+    bufferQueue: BufferQueue,
+    dlq: DeadLetterQueue,
+    workers: WorkerInfo[],
+    routingStrategy: RoutingStrategy,
+    trafficActive: boolean,
+    targetRps: number,
+    maxConcurrencyPerWorker: number
+  ): TelemetryFrame {
+    return this.buildFrame(
+      bufferQueue,
+      dlq,
+      workers,
+      routingStrategy,
+      trafficActive,
+      targetRps,
+      maxConcurrencyPerWorker
+    );
+  }
+
+  private buildFrame(
+    bufferQueue: BufferQueue,
+    dlq: DeadLetterQueue,
+    workers: WorkerInfo[],
+    routingStrategy: RoutingStrategy,
+    trafficActive: boolean,
+    targetRps: number,
+    maxConcurrencyPerWorker: number
+  ): TelemetryFrame {
     const bufferStats = bufferQueue.getStats();
 
     return {
       timestamp: Date.now(),
       trafficActive,
       activeTargetRps: trafficActive ? targetRps : 0,
+      maxConcurrencyPerWorker,
       metrics: {
         incomingRps: this.currentIncomingRps,
         acceptedRps: this.currentAcceptedRps,
@@ -160,7 +228,7 @@ export class MetricsCollector {
   }
 
   public getCumulativeTotals() {
-    const { p50, p95, p99 } = computePercentiles(this.cumulativeSamples);
+    const { p50, p95, p99 } = computePercentiles(this.cumulativeProcessingSamples);
     return {
       totalIngressed: this.totalIngressed,
       totalAccepted: this.totalAccepted,
@@ -173,21 +241,34 @@ export class MetricsCollector {
   }
 
   public resetLatencySamples(): void {
-    this.latencySamples = [];
+    this.ingressSamples = [];
+    this.processingSamples = [];
     this.p50Latency = 0;
     this.p95Latency = 0;
     this.p99Latency = 0;
   }
 
   public reset(): void {
+    this.windowIncoming = 0;
+    this.windowAccepted = 0;
+    this.windowRateLimited = 0;
+    this.windowDuplicates = 0;
+    this.windowDrained = 0;
+    this.currentIncomingRps = 0;
+    this.currentAcceptedRps = 0;
+    this.currentRateLimitedRps = 0;
+    this.currentDuplicateRps = 0;
+    this.currentDrainedRps = 0;
     this.totalIngressed = 0;
     this.totalAccepted = 0;
     this.totalProcessed = 0;
     this.totalFailed = 0;
-    this.latencySamples = [];
-    this.cumulativeSamples = [];
+    this.ingressSamples = [];
+    this.processingSamples = [];
+    this.cumulativeProcessingSamples = [];
     this.p50Latency = 0;
     this.p95Latency = 0;
     this.p99Latency = 0;
+    this.lastTickTime = performance.now();
   }
 }

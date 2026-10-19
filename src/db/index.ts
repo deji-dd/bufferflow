@@ -13,13 +13,16 @@ export interface DbConfig {
   password?: string;
 }
 
+const RETRY_COOLDOWN_MS = 15_000;
+
 let dbInstance: ReturnType<typeof drizzle<typeof schema>> | null = null;
 let sqlClient: ReturnType<typeof postgres> | null = null;
 let isInitialized = false;
 let isConnectedToPostgres = false;
+let lastInitAttemptAt = 0;
 
 export async function getDb() {
-  if (!isInitialized) {
+  if (!isInitialized && Date.now() - lastInitAttemptAt >= RETRY_COOLDOWN_MS) {
     await initDb();
   }
   return dbInstance;
@@ -29,9 +32,19 @@ export function isDbConnected(): boolean {
   return isConnectedToPostgres;
 }
 
-export async function initDb(): Promise<boolean> {
+export async function initDb(force: boolean = false): Promise<boolean> {
   if (isInitialized) return isConnectedToPostgres;
-  isInitialized = true;
+  // Avoid hammering a down database on every history call.
+  if (!force && Date.now() - lastInitAttemptAt < RETRY_COOLDOWN_MS) {
+    return isConnectedToPostgres;
+  }
+  lastInitAttemptAt = Date.now();
+
+  // Deterministic tests and local UI-only runs can opt out explicitly.
+  if (process.env.BUFFERFLOW_DISABLE_DB === '1') {
+    isInitialized = true;
+    return false;
+  }
 
   const isProd = process.env.NODE_ENV === 'production';
   const customUrl = process.env.DATABASE_URL;
@@ -54,11 +67,14 @@ export async function initDb(): Promise<boolean> {
     console.log(
       '[Bufferflow DB] Running in local development mode (no PostgreSQL socket found). Historical results stored in memory.'
     );
+    isInitialized = true;
     return false;
   }
 
+  let client: ReturnType<typeof postgres> | undefined;
+  let connected = false;
+
   try {
-    let client: ReturnType<typeof postgres>;
     if (customUrl) {
       client = postgres(customUrl, { connect_timeout: 3, max: 10 });
     } else {
@@ -78,6 +94,7 @@ export async function initDb(): Promise<boolean> {
 
     sqlClient = client;
     dbInstance = drizzle(client, { schema });
+    connected = true;
 
     // Migration handling:
     // In production, always ensure pending migrations are applied automatically on boot.
@@ -107,6 +124,7 @@ export async function initDb(): Promise<boolean> {
       }
     }
 
+    isInitialized = true;
     isConnectedToPostgres = true;
 
     console.log(
@@ -114,11 +132,22 @@ export async function initDb(): Promise<boolean> {
     );
     return true;
   } catch (err: any) {
+    // Close a partially-created pool so failed attempts do not leak sockets.
+    if (client && !connected) {
+      try {
+        await client.end({ timeout: 5 });
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
     console.warn(
       `[Bufferflow DB] PostgreSQL unavailable (${err?.message || err}). Falling back to resilient in-memory historical storage.`
     );
     isConnectedToPostgres = false;
     dbInstance = null;
+    sqlClient = null;
+    // Allow a later getDb() call to retry after the cooldown.
+    isInitialized = false;
     return false;
   }
 }
@@ -129,5 +158,7 @@ export async function closeDb(): Promise<void> {
     sqlClient = null;
     dbInstance = null;
     isConnectedToPostgres = false;
+    isInitialized = false;
+    lastInitAttemptAt = 0;
   }
 }

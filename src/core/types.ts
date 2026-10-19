@@ -9,6 +9,20 @@ export type RoutingStrategy =
   | 'WEIGHTED_LEAST_CONNECTIONS'
   | 'CONSISTENT_HASH';
 
+export const ROUTING_STRATEGIES: readonly RoutingStrategy[] = [
+  'LEAST_CONNECTIONS',
+  'WEIGHTED_ROUND_ROBIN',
+  'ROUND_ROBIN',
+  'RANDOM',
+  'POWER_OF_TWO_CHOICES',
+  'WEIGHTED_LEAST_CONNECTIONS',
+  'CONSISTENT_HASH',
+];
+
+export function isRoutingStrategy(value: unknown): value is RoutingStrategy {
+  return typeof value === 'string' && (ROUTING_STRATEGIES as readonly string[]).includes(value);
+}
+
 export type WorkerState = 'IDLE' | 'BUSY' | 'CIRCUIT_OPEN' | 'HALF_OPEN';
 
 export interface IngressPayload {
@@ -65,6 +79,22 @@ export interface SystemConfig {
   maxRetries: number;
   mockDownstreamLatencyMs: number;
   mockDownstreamFailureRate: number; // 0-100%
+  maxConcurrencyPerWorker: number;
+}
+
+/**
+ * Runtime patch accepted by the config/start endpoints. It combines system
+ * settings with traffic-generator settings so a single validated patch can be
+ * applied consistently. Unknown fields are rejected by the HTTP layer.
+ */
+export interface ConfigPatch extends Partial<SystemConfig> {
+  targetRps?: number;
+  durationSec?: number;
+  isUnlimited?: boolean;
+  schemaType?: string;
+  failureRate?: number;
+  downstreamLatencyMs?: number;
+  idempotencyCollisionRate?: number;
 }
 
 export interface BurstProgress {
@@ -157,10 +187,10 @@ export interface TelemetryFrame {
   timestamp: number;
   trafficActive: boolean;
   activeTargetRps: number;
+  maxConcurrencyPerWorker: number;
   burstProgress?: BurstProgress;
   suiteProgress?: SuiteProgress;
   isServerRunningTest?: boolean;
-  suiteResults?: FullSuiteResults;
   metrics: {
     incomingRps: number;
     acceptedRps: number;

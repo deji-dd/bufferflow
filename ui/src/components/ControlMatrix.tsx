@@ -20,15 +20,15 @@ import {
 } from '@/components/ui/select';
 import { Slider } from '@/components/ui/slider';
 import { cn } from '@/lib/utils';
-import type { BurstProgress, SuiteProgress } from '../../../src/core/types';
+import type {
+  BurstProgress,
+  TrafficConfig as ServerTrafficConfig,
+  SuiteProgress,
+} from '../../../src/core/types';
 
-export interface TrafficConfig {
-  targetRps: number;
-  durationSec: number;
-  isUnlimited?: boolean;
-  failureRate: number;
-  downstreamLatencyMs: number;
-  idempotencyCollisionRate: number;
+// UI traffic config extends the server's traffic-generator config with the
+// runtime worker/strategy knobs that are sent along with a start request.
+export interface TrafficConfig extends ServerTrafficConfig {
   workerCount: number;
   routingStrategy: string;
 }
