@@ -1,5 +1,5 @@
 # Multi-stage optimized Bun Dockerfile for Bufferflow
-FROM oven/bun:1.4.3 AS base
+FROM oven/bun:1.4.4 AS base
 WORKDIR /app
 
 # Full dependency tree (build-time)

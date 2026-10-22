@@ -1,7 +1,9 @@
 import type React from 'react';
+
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
+
 import type { TelemetryFrame } from '../../../src/core/types';
 import { useAnimatedNumber } from '../hooks/useAnimatedNumber';
 

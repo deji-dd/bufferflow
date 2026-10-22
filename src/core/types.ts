@@ -149,10 +149,7 @@ export interface FullSuiteResults {
   levelsTested?: number[];
   levelBreakdowns?: Record<number, Record<string, StrategyBenchmark>>;
   completedReason:
-    | 'completed'
-    | 'stopped_by_user'
-    | 'safety_fallback_blur'
-    | 'safety_fallback_unload';
+    'completed' | 'stopped_by_user' | 'safety_fallback_blur' | 'safety_fallback_unload';
   config: {
     targetRps: number;
     durationSec: number;

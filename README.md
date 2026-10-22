@@ -78,14 +78,17 @@ flowchart LR
 ## Quickstart
 
 ### Prerequisites
+
 - [Bun](https://bun.sh) (v1.2+) or Docker
 
 ### 1. Install Dependencies
+
 ```bash
 bun install
 ```
 
 ### 2. Configure Environment (optional)
+
 ```bash
 cp .env.example .env
 # Adjust PostgreSQL settings; the app falls back to in-memory history
@@ -93,16 +96,19 @@ cp .env.example .env
 ```
 
 ### 3. Run Test Suite
+
 ```bash
 bun test
 ```
 
 ### 4. Start Development Server
+
 ```bash
 bun run dev
 ```
 
 Open your browser to:
+
 ```
 http://localhost:3001
 ```
@@ -112,11 +118,13 @@ http://localhost:3001
 ## Docker Deployment
 
 ### Run with Docker Compose
+
 ```bash
 docker compose up -d --build
 ```
 
 View logs:
+
 ```bash
 docker compose logs -f bufferflow
 ```
@@ -125,24 +133,24 @@ docker compose logs -f bufferflow
 
 ## API Reference
 
-| Endpoint | Method | Description |
-| :--- | :--- | :--- |
-| `/api/auth/status` | `GET` | Public auth discovery (`{ "required": boolean }`) used by the dashboard token gate. |
-| `/api/ingress` | `POST` | High-speed ingress gateway returning `202 Accepted` (<10ms). Accepts optional `Idempotency-Key` header. A `503` buffer-overflow response does **not** consume the idempotency key, so the request can be retried. |
-| `/api/traffic/start` | `POST` | Start the in-process concurrent traffic generator. Applies the requested failure rate, downstream latency, worker count and routing strategy before starting. Returns `409` while a server suite is running. Clears prior run history and cached suite results. |
-| `/api/traffic/full-test` | `POST` | Start the server-managed multi-strategy benchmark suite (single level or all 4 levels). Returns `409` while another suite is running. |
-| `/api/traffic/stop` | `POST` / `GET` | Halt active traffic and/or a running suite. Optional `reason` (`stopped_by_user`, `safety_fallback_blur`, `safety_fallback_unload`). Returns `suiteResults: null` when no suite was running. |
-| `/api/traffic/status` | `GET` | Traffic generator status, effective traffic config, suite progress and the last compiled suite result. |
-| `/api/traffic/suite-results` | `GET` | Last compiled full-suite result (or an error object when none exists). |
-| `/api/dlq` | `GET` | Paginated listing of dead-letter queue records (`limit` 1–500). |
-| `/api/dlq/replay` | `POST` | Replay single item (`{ "id": "..." }`) or all items back to the buffer. Replay stops if the buffer is full and keeps unreplayed records in the DLQ. |
-| `/api/dlq` | `DELETE` | Purge dead-letter queue. |
-| `/api/config` | `GET` / `POST` | Inspect or dynamically reconfigure runtime cluster parameters (including `maxConcurrencyPerWorker`) live. Partial patches preserve unspecified fields. Locked during server suite runs. |
-| `/api/metrics` | `GET` | Snapshot of the latest telemetry frame (does not reset the 250ms scheduler window). |
-| `/api/metrics/reset` | `POST` | Reset cumulative counters, RPS windows, latency samples, worker counters and the buffer. |
-| `/api/history` | `GET` / `POST` | List or save historical runs. Manual runs are stored as `STANDARD`; automated suites as `FULL_SUITE`. |
-| `/api/history/:id` | `GET` / `DELETE` | Fetch or delete a historical run. |
-| `/ws` | `WebSocket` | Real-time telemetry broadcast (250ms while busy, 1s when idle; session-scoped via `?session=`). |
+| Endpoint                     | Method           | Description                                                                                                                                                                                                                                                     |
+| :--------------------------- | :--------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/api/auth/status`           | `GET`            | Public auth discovery (`{ "required": boolean }`) used by the dashboard token gate.                                                                                                                                                                             |
+| `/api/ingress`               | `POST`           | High-speed ingress gateway returning `202 Accepted` (<10ms). Accepts optional `Idempotency-Key` header. A `503` buffer-overflow response does **not** consume the idempotency key, so the request can be retried.                                               |
+| `/api/traffic/start`         | `POST`           | Start the in-process concurrent traffic generator. Applies the requested failure rate, downstream latency, worker count and routing strategy before starting. Returns `409` while a server suite is running. Clears prior run history and cached suite results. |
+| `/api/traffic/full-test`     | `POST`           | Start the server-managed multi-strategy benchmark suite (single level or all 4 levels). Returns `409` while another suite is running.                                                                                                                           |
+| `/api/traffic/stop`          | `POST` / `GET`   | Halt active traffic and/or a running suite. Optional `reason` (`stopped_by_user`, `safety_fallback_blur`, `safety_fallback_unload`). Returns `suiteResults: null` when no suite was running.                                                                    |
+| `/api/traffic/status`        | `GET`            | Traffic generator status, effective traffic config, suite progress and the last compiled suite result.                                                                                                                                                          |
+| `/api/traffic/suite-results` | `GET`            | Last compiled full-suite result (or an error object when none exists).                                                                                                                                                                                          |
+| `/api/dlq`                   | `GET`            | Paginated listing of dead-letter queue records (`limit` 1–500).                                                                                                                                                                                                 |
+| `/api/dlq/replay`            | `POST`           | Replay single item (`{ "id": "..." }`) or all items back to the buffer. Replay stops if the buffer is full and keeps unreplayed records in the DLQ.                                                                                                             |
+| `/api/dlq`                   | `DELETE`         | Purge dead-letter queue.                                                                                                                                                                                                                                        |
+| `/api/config`                | `GET` / `POST`   | Inspect or dynamically reconfigure runtime cluster parameters (including `maxConcurrencyPerWorker`) live. Partial patches preserve unspecified fields. Locked during server suite runs.                                                                         |
+| `/api/metrics`               | `GET`            | Snapshot of the latest telemetry frame (does not reset the 250ms scheduler window).                                                                                                                                                                             |
+| `/api/metrics/reset`         | `POST`           | Reset cumulative counters, RPS windows, latency samples, worker counters and the buffer.                                                                                                                                                                        |
+| `/api/history`               | `GET` / `POST`   | List or save historical runs. Manual runs are stored as `STANDARD`; automated suites as `FULL_SUITE`.                                                                                                                                                           |
+| `/api/history/:id`           | `GET` / `DELETE` | Fetch or delete a historical run.                                                                                                                                                                                                                               |
+| `/ws`                        | `WebSocket`      | Real-time telemetry broadcast (250ms while busy, 1s when idle; session-scoped via `?session=`).                                                                                                                                                                 |
 
 When `BUFFERFLOW_API_TOKEN` is configured, every endpoint in this table except `/api/auth/status` (including `/api/ingress` and `/ws`) requires a matching bearer token.
 
@@ -180,15 +188,15 @@ The script updates `test_type = 'STANDARD'` only where `test_type = 'FULL_SUITE'
 
 ### Environment Variables
 
-| Variable | Description |
-| :--- | :--- |
-| `PORT` | HTTP/WS listen port (default `3001`). |
-| `DATABASE_URL` | Optional full PostgreSQL connection string; takes precedence over `POSTGRES_*`. |
-| `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | PostgreSQL connection when `DATABASE_URL` is not set. |
-| `RUN_MIGRATIONS` | Set `true` to apply migrations on every development boot. Production applies them automatically. |
-| `BUFFERFLOW_DISABLE_DB` | Set `1` to force in-memory history storage (used by tests). |
-| `BUFFERFLOW_API_TOKEN` | Optional shared bearer token protecting all API and WebSocket endpoints. |
-| `BUFFERFLOW_MAX_BODY_BYTES` | Maximum request body size in bytes (default `1048576`, 1 MiB). |
-| `BUFFERFLOW_PORT` | Host-side port used by `docker-compose.yml`. |
+| Variable                                                                                  | Description                                                                                      |
+| :---------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------- |
+| `PORT`                                                                                    | HTTP/WS listen port (default `3001`).                                                            |
+| `DATABASE_URL`                                                                            | Optional full PostgreSQL connection string; takes precedence over `POSTGRES_*`.                  |
+| `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | PostgreSQL connection when `DATABASE_URL` is not set.                                            |
+| `RUN_MIGRATIONS`                                                                          | Set `true` to apply migrations on every development boot. Production applies them automatically. |
+| `BUFFERFLOW_DISABLE_DB`                                                                   | Set `1` to force in-memory history storage (used by tests).                                      |
+| `BUFFERFLOW_API_TOKEN`                                                                    | Optional shared bearer token protecting all API and WebSocket endpoints.                         |
+| `BUFFERFLOW_MAX_BODY_BYTES`                                                               | Maximum request body size in bytes (default `1048576`, 1 MiB).                                   |
+| `BUFFERFLOW_PORT`                                                                         | Host-side port used by `docker-compose.yml`.                                                     |
 
 If PostgreSQL is unreachable the app logs a warning and keeps historical runs in memory; it retries the connection in the background rather than disabling persistence for the rest of the process lifetime.

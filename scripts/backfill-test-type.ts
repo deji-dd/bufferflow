@@ -12,6 +12,7 @@
  *   bun run db:backfill:test-type
  */
 import { existsSync } from 'node:fs';
+
 import postgres from 'postgres';
 
 const dryRun = process.argv.includes('--dry-run');

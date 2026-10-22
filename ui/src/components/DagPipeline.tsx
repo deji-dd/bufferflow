@@ -23,8 +23,10 @@ import {
 } from 'lucide-react';
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
+
 import type { TelemetryFrame } from '../../../src/core/types';
 
 interface DagPipelineProps {

@@ -1,5 +1,6 @@
 import type React from 'react';
 import { useEffect, useState } from 'react';
+
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -10,6 +11,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+
 import type { StrategyBenchmark, WorkerInfo } from '../../../src/core/types';
 import type { TrafficConfig } from './ControlMatrix';
 
@@ -24,10 +26,7 @@ export interface TestRunResults {
   completedAt: string;
   durationSec: number;
   completedReason:
-    | 'completed'
-    | 'stopped_by_user'
-    | 'safety_fallback_blur'
-    | 'safety_fallback_unload';
+    'completed' | 'stopped_by_user' | 'safety_fallback_blur' | 'safety_fallback_unload';
   config: TrafficConfig;
   strategiesTested?: string[];
   strategyBreakdown?: Record<string, StrategyBenchmark>;

@@ -1,6 +1,7 @@
 import { Dices, Lock, SlidersHorizontal, Sparkles, Square, Zap } from 'lucide-react';
 import type React from 'react';
 import { useState } from 'react';
+
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -20,10 +21,11 @@ import {
 } from '@/components/ui/select';
 import { Slider } from '@/components/ui/slider';
 import { cn } from '@/lib/utils';
+
 import type {
   BurstProgress,
-  TrafficConfig as ServerTrafficConfig,
   SuiteProgress,
+  TrafficConfig as ServerTrafficConfig,
 } from '../../../src/core/types';
 
 // UI traffic config extends the server's traffic-generator config with the

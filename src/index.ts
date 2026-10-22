@@ -1,6 +1,7 @@
 import { cors } from '@elysiajs/cors';
 import { staticPlugin } from '@elysiajs/static';
 import { Elysia, t } from 'elysia';
+
 import {
   getConfiguredToken,
   getMaxRequestBodyBytes,

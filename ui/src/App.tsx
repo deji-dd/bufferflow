@@ -1,5 +1,6 @@
 import type React from 'react';
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+
 import type { BurstProgress, SuiteProgress, TelemetryFrame } from '../../src/core/types';
 import { ControlMatrix, type TrafficConfig } from './components/ControlMatrix';
 import { Footer } from './components/Footer';

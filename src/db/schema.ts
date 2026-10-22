@@ -1,4 +1,5 @@
 import { boolean, index, integer, jsonb, pgTable, text, timestamp } from 'drizzle-orm/pg-core';
+
 import type { StrategyBenchmark, WorkerInfo } from '../core/types';
 
 export const testRunsTable = pgTable(

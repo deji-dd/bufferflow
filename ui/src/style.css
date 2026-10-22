@@ -1,7 +1,7 @@
-@import "tailwindcss";
-@import "tw-animate-css";
-@import "shadcn/tailwind.css";
-@import "@fontsource-variable/geist";
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import 'shadcn/tailwind.css';
+@import '@fontsource-variable/geist';
 
 @custom-variant dark (&:is(.dark *));
 
@@ -95,7 +95,7 @@ html.light .glass-card:hover {
   border-color: rgba(0, 0, 0, 0.16);
 }
 
-html.light .text-white:not(button):not([data-slot="button"]):not(.keep-white) {
+html.light .text-white:not(button):not([data-slot='button']):not(.keep-white) {
   color: #0f172a !important;
 }
 
@@ -144,7 +144,7 @@ html.light .bg-\[\#0d111a\] {
 }
 
 /* Select Dropdown Menus - Solid Opaque for High Readability */
-[data-slot="select-content"] {
+[data-slot='select-content'] {
   background-color: #0c101b !important;
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
@@ -152,31 +152,31 @@ html.light .bg-\[\#0d111a\] {
   box-shadow: 0 16px 36px rgba(0, 0, 0, 0.75) !important;
 }
 
-html.light [data-slot="select-content"] {
+html.light [data-slot='select-content'] {
   background-color: #ffffff !important;
   color: #0f172a !important;
   border-color: rgba(0, 0, 0, 0.15) !important;
   box-shadow: 0 12px 30px rgba(0, 0, 0, 0.15) !important;
 }
 
-html.light [data-slot="select-item"] {
+html.light [data-slot='select-item'] {
   color: #0f172a !important;
 }
 
-html.light [data-slot="select-item"]:hover,
-html.light [data-slot="select-item"]:focus {
+html.light [data-slot='select-item']:hover,
+html.light [data-slot='select-item']:focus {
   background-color: #f1f5f9 !important;
   color: #0284c7 !important;
 }
 
 /* Dialog / Modal Theming (Solid in Dark & Light Mode) */
-[data-slot="dialog-content"] {
+[data-slot='dialog-content'] {
   background-color: #0d121f !important;
   border-color: rgba(255, 255, 255, 0.12) !important;
   color: #f1f5f9;
 }
 
-html.light [data-slot="dialog-content"] {
+html.light [data-slot='dialog-content'] {
   background-color: #ffffff !important;
   color: #0f172a !important;
   border: 1px solid rgba(0, 0, 0, 0.12) !important;
@@ -185,31 +185,31 @@ html.light [data-slot="dialog-content"] {
     0 0 0 1px rgba(0, 0, 0, 0.05) !important;
 }
 
-html.light [data-slot="dialog-content"] .text-white {
+html.light [data-slot='dialog-content'] .text-white {
   color: #0f172a !important;
 }
 
-html.light [data-slot="dialog-content"] [data-slot="dialog-title"] {
+html.light [data-slot='dialog-content'] [data-slot='dialog-title'] {
   color: #0f172a !important;
 }
 
-html.light [data-slot="dialog-content"] [data-slot="dialog-description"] {
+html.light [data-slot='dialog-content'] [data-slot='dialog-description'] {
   color: #475569 !important;
 }
 
-html.light [data-slot="dialog-close"] {
+html.light [data-slot='dialog-close'] {
   color: #64748b !important;
 }
 
-html.light [data-slot="dialog-close"]:hover {
+html.light [data-slot='dialog-close']:hover {
   color: #0f172a !important;
 }
 
-html.light [data-slot="slider-track"] {
+html.light [data-slot='slider-track'] {
   background-color: rgba(0, 0, 0, 0.08) !important;
 }
 
-html.light [data-slot="slider-thumb"] {
+html.light [data-slot='slider-thumb'] {
   border-color: #0f172a !important;
   background-color: #ffffff !important;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2) !important;
@@ -504,7 +504,7 @@ html.light,
     @apply bg-background text-foreground;
   }
   button:not(:disabled),
-  [role="button"]:not(:disabled) {
+  [role='button']:not(:disabled) {
     cursor: pointer;
   }
   html {
